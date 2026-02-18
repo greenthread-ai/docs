@@ -15,15 +15,21 @@ LoRA adapter loading uses a cache-on-demand pattern:
 5. Subsequent requests for the same adapter and `hash` are served from cache instantly.
 
 <Mermaid chart={`
-flowchart TD
-    A["Client sends request\nwith lora_adapter_metadata"] --> B{"Adapter\ncached?"}
-    B -- Yes --> C["200 OK\nServe from cache"]
-    B -- No --> D["404 Not Found"]
-    D --> E["Proxy generates\nsigned URLs"]
-    E --> F["Retry with files[] included"]
-    F --> G["GreenThread downloads\n& caches adapter"]
-    G --> C
-    C --> H["Subsequent requests\nserved instantly"]
+sequenceDiagram
+    participant P as Your Proxy
+    participant G as GreenThread
+    participant S as Object Storage
+
+    P->>G: Inference request with adapter id + hash
+    G-->>P: 404 Adapter not cached
+    Note over P: Generate signed<br/>download URLs
+    P->>G: Retry request with signed file URLs
+    G->>S: Download adapter weights
+    S-->>G: Adapter weights
+    Note over G: Cache adapter locally
+    G-->>P: 200 Inference response
+    P->>G: Next request with same adapter id + hash
+    G-->>P: 200 Served from cache
 `} />
 
 This means no upfront provisioning, no unnecessary S3 operations, and no per-request latency penalty once cached.

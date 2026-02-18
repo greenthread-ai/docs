@@ -16,23 +16,32 @@ All of this happens transparently behind an OpenAI-compatible API.
 
 <Mermaid chart={`
 flowchart LR
-    Client["Client\n(OpenAI SDK)"] --> API["HTTP API"]
-    API --> Controller["Controller"]
-    Controller --> B1["Inference\nBackend"]
-    Controller --> B2["Inference\nBackend"]
-    Controller --> Storage["Storage\nServer"]
-    Storage --> RAM["CPU Cache"]
-    Storage --> Disk["Disk"]
-    B1 --> GPU1["GPU 0"]
-    B2 --> GPU2["GPU 1"]
+    subgraph Clients
+        C1["Llama 3 8B request"]
+        C2["Mistral 7B request"]
+        C3["Qwen 14B request"]
+    end
+
+    subgraph GreenThread
+        API["API + Controller"]
+        STR["Storage Server\nCPU weight cache"]
+    end
+
+    subgraph GPUs
+        G0["GPU 0"]
+        G1["GPU 1"]
+    end
+
+    C1 --> API
+    C2 --> API
+    C3 --> API
+    API --> G0
+    API --> G1
+    STR -.->|wake| G0
+    STR -.->|wake| G1
 `} />
 
-| Component | Purpose |
-|-----------|---------|
-| HTTP API | OpenAI-compatible endpoints on port 8080 |
-| Controller | Model registry, state machine, GPU scheduling |
-| Storage Server | Weight caching, memory management, checkpoint storage |
-| Inference Backend | Model execution with custom loader for fast sleep/wake |
+Each GPU runs the active model and holds sleeping models in CPU memory. When a request arrives for a sleeping model, GreenThread swaps it onto a GPU in under 2 seconds — no cold start, no dedicated GPU per model.
 
 ## Performance
 
