@@ -1,0 +1,145 @@
+import { Callout } from '../components/callout'
+
+Common issues and how to resolve them.
+
+## Services won't start
+
+Check the service status and logs:
+
+```bash
+systemctl status gthread-engine gthread-storage
+journalctl -u gthread-engine --no-pager -n 50
+journalctl -u gthread-storage --no-pager -n 50
+```
+
+**Storage must start before engine.** The engine depends on the storage server. If both are down, start them in order:
+
+```bash
+sudo systemctl start gthread-storage
+sudo systemctl start gthread-engine
+```
+
+## Licence validation fails
+
+If you see licence errors in the logs:
+
+- Verify your token is correct: `echo $GTHREAD_LICENCE_TOKEN`
+- Check outbound HTTPS access to `licence.greenthread.ai`
+- Confirm your licence hasn't expired — contact your account team if unsure
+
+GreenThread caches a valid licence locally for up to 7 days. If the licence server is temporarily unreachable, the platform continues running in grace mode.
+
+## nvidia-smi not found
+
+The NVIDIA driver is not installed or not loaded. Install the 590 driver package:
+
+```bash
+sudo apt install -y nvidia-driver-590
+sudo reboot
+```
+
+## GDS check fails
+
+If `/usr/local/cuda/gds/tools/gdscheck -p` reports issues:
+
+1. Ensure the `nvidia-gds` package is installed: `sudo apt install -y nvidia-gds`
+2. Verify the NVIDIA driver is loaded: `nvidia-smi`
+3. Check kernel module: `lsmod | grep nvidia_fs`
+4. Consult the [NVIDIA GDS documentation](https://docs.nvidia.com/gpudirect-storage/) for your specific hardware
+
+## Models fail to load
+
+If a model enters the `error` state after adding it:
+
+```bash
+# Check model-specific logs
+curl http://localhost:8080/api/models/your-model-name/health
+
+# View engine logs for the model
+journalctl -u gthread-engine | grep "your-model-name"
+```
+
+Common causes:
+
+- **Out of GPU memory**: Reduce `gpu_memory_utilization` or `max_model_len` in the model config
+- **Model not found**: Verify the `model_name` is a valid HuggingFace identifier
+- **Missing HuggingFace token**: Some models require authentication — set `HF_TOKEN` in `/opt/gthread/config/engine.env`
+- **Quantization mismatch**: The `quantization` setting must match how the model was quantized
+
+## Slow wake times
+
+If models take longer than expected to wake:
+
+| Expected | Actual | Likely cause |
+|----------|--------|-------------|
+| ~1.8s | ~1.8s | Normal (system RAM tier) |
+| ~1.8s | ~30-40s | Model fell back to disk tier — check staging with `GET /api/models/{name}/staging` |
+| ~30-40s | ~30-40s | Normal (disk tier) |
+| ~30-40s | >60s | Disk I/O bottleneck — check drive health and throughput |
+
+To ensure fast wake times, pin critical models in system RAM:
+
+```bash
+curl -X POST http://localhost:8080/api/models/your-model/staging \
+  -H "Content-Type: application/json" \
+  -d '{"tier": "system", "pin": true}'
+```
+
+## Health endpoint returns unhealthy
+
+```bash
+curl http://localhost:8080/health | python3 -m json.tool
+```
+
+Check the `components` object to identify which component is failing:
+
+| Component | Unhealthy cause |
+|-----------|----------------|
+| `engine` | Engine process crashed — check `journalctl -u gthread-engine` |
+| `storage` | Storage server unreachable — check `journalctl -u gthread-storage` |
+| `licence` | Licence invalid or expired |
+| `models` | All loaded models are in error state |
+
+## Upgrading
+
+To upgrade GreenThread to the latest version, re-run the installer:
+
+```bash
+curl -sSL https://licence.greenthread.ai/api/v1/platform/install.sh | \
+  GTHREAD_LICENCE_TOKEN=gthread_your_key_here sudo -E bash -- \
+  --models-dir /ephemeral/models
+```
+
+The upgrade downloads the new version while the current version keeps running, then swaps atomically with 2-5 seconds of downtime. Configuration files are preserved.
+
+<Callout type="info" title="Rollback">
+The last 2 versions are kept in `/opt/gthread/versions/`. To roll back, stop services, update the `/opt/gthread/current` symlink to the previous version, and restart.
+</Callout>
+
+## Port conflicts
+
+GreenThread listens on port 8080 by default. If another process is using this port:
+
+```bash
+sudo ss -tlnp | grep 8080
+```
+
+## Getting help
+
+If you're stuck, collect the following before contacting support:
+
+```bash
+# System info
+nvidia-smi
+cat /etc/os-release
+
+# Service status
+systemctl status gthread-engine gthread-storage
+
+# Recent logs
+journalctl -u gthread-engine --no-pager -n 100 > engine.log
+journalctl -u gthread-storage --no-pager -n 100 > storage.log
+
+# Health
+curl http://localhost:8080/health
+```

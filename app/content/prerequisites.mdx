@@ -1,0 +1,75 @@
+import { Callout } from '../components/callout'
+
+Before installing GreenThread, you need to set up the NVIDIA driver, GPU Direct Storage, and Python. Complete each step and verify it before moving on.
+
+## NVIDIA driver 590
+
+Install the NVIDIA 590 driver package:
+
+```bash
+sudo apt update
+sudo apt install -y nvidia-driver-590
+```
+
+Reboot after installation:
+
+```bash
+sudo reboot
+```
+
+Verify the driver is working:
+
+```bash
+nvidia-smi
+```
+
+You should see your GPUs listed with driver version 590.x and CUDA version 12.x.
+
+<Callout type="warning" title="Driver version matters">
+GreenThread requires the 590 driver package. Older drivers may not support the GPU memory features needed for fast model swapping.
+</Callout>
+
+## GPU Direct Storage
+
+GPU Direct Storage (GDS) enables high-throughput data transfers between storage and GPU memory. This is required for GreenThread's fast wake performance.
+
+Install the GDS package:
+
+```bash
+sudo apt install -y nvidia-gds
+```
+
+Verify GDS is working:
+
+```bash
+/usr/local/cuda/gds/tools/gdscheck -p
+```
+
+The output should show `GDS is supported` for your storage devices. If any checks fail, consult the [NVIDIA GDS documentation](https://docs.nvidia.com/gpudirect-storage/) for troubleshooting.
+
+<Callout type="tip" title="Test thoroughly">
+Run the full GDS check before proceeding. GDS issues are much easier to diagnose before GreenThread is installed than after. Fixing driver or GDS problems on a running system is significantly harder.
+</Callout>
+
+## Python 3.12
+
+GreenThread requires Python 3.12 with development headers and virtual environment support:
+
+```bash
+sudo apt install -y python3.12 python3.12-venv python3.12-dev
+```
+
+Verify:
+
+```bash
+python3.12 --version
+```
+
+## Checklist
+
+Before running the installer, confirm:
+
+- [ ] `nvidia-smi` shows all GPUs with driver 590.x
+- [ ] `gdscheck -p` reports GDS is supported
+- [ ] `python3.12 --version` returns 3.12.x
+- [ ] You have your `gthread_xxx` licence key ready

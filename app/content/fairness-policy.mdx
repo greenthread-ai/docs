@@ -1,0 +1,72 @@
+import { Callout } from '../components/callout'
+
+When multiple models compete for limited GPU memory, GreenThread uses a fairness policy to prevent starvation. The policy ensures that no model waits indefinitely for GPU access while another model monopolizes resources.
+
+## How preemption works
+
+A background monitor runs every `fairness_check_period` (default: 1 second) and checks for starving models:
+
+1. **Detect starvation**: Find models in `pending` state that have waited longer than `fairness_max_wait_time` (default: 5s).
+2. **Check fit**: If the pending model fits alongside current occupants (memory-aware bin packing), no preemption is needed — the orchestrator will wake it normally.
+3. **Select victim**: Find a `serving` model on the same GPUs that has run longer than `fairness_min_runtime` (default: 10s).
+4. **Preempt**: Transition the victim to `deactivating` → drain in-flight requests → `sleeping`.
+5. **Wake**: The pending model is woken into the freed GPU memory.
+
+## Configuration parameters
+
+All fairness parameters are configurable at runtime:
+
+| Parameter | Default | Range | Description |
+|-----------|---------|-------|-------------|
+| `fairness_min_runtime` | 10s | 1s – 10min | Minimum time a model must serve before it can be preempted |
+| `fairness_max_wait_time` | 5s | 1s – 5min | How long a pending model waits before triggering preemption |
+| `fairness_check_period` | 1s | 100ms – 10s | How often the monitor scans for starvation |
+| `fairness_drain_timeout` | 30s | 5s – 10min | Max wait for in-flight requests to complete during preemption |
+
+## Popular model protection
+
+Models marked as `popular` are protected from fairness preemption. The scheduler selects non-popular models first when choosing preemption victims.
+
+If a popular model is preempted (e.g., by explicit API sleep), GreenThread tracks this and attempts auto-restoration:
+
+- When the preempting model's queue empties, the platform checks if the displaced popular model can be restored.
+- A background monitor periodically scans for preempted popular models that can be restored.
+- GPU memory availability is verified before attempting restoration.
+
+Mark a model as popular:
+
+```bash
+curl -X POST https://your-host:8080/api/models/set_popular \
+  -H "Content-Type: application/json" \
+  -d '{"backend_name": "llama-3-8b", "popular": true}'
+```
+
+## Memory-aware scheduling
+
+Preemption decisions account for actual GPU memory usage:
+
+- The scheduler estimates per-GPU serving memory for each model.
+- Before preempting, it checks whether the pending model fits alongside remaining occupants.
+- If multiple models share a GPU (multi-tenant bin packing), only the minimum number of models are preempted.
+
+## Preemption barrier
+
+GreenThread uses an atomic preemption barrier to safely swap models without dropping requests:
+
+1. `PreemptionRequested` flag is set — `TryClaimRequest()` immediately starts returning `false` for new requests.
+2. The system waits for `InFlightCount` to reach zero (bounded by `fairness_drain_timeout`).
+3. Once drained, the sleep operation proceeds.
+
+This ensures that serving requests complete normally while preventing new requests from being accepted on a model about to sleep.
+
+<Callout type="info" title="Grace period">
+Models have a grace period after waking (`BecameServingAt` timestamp). The fairness monitor won't preempt a model that has been serving for less than `fairness_min_runtime`, giving it time to process its queue.
+</Callout>
+
+## Preemption order
+
+When choosing which model to preempt, the scheduler follows this priority:
+
+1. Skip popular models.
+2. Among eligible models, prefer those that have been serving the longest (LRU order).
+3. Only preempt models on the same GPUs that the pending model needs.

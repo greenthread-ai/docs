@@ -1,0 +1,86 @@
+import { ApiEndpoint } from '../components/api-endpoint'
+import { Callout } from '../components/callout'
+
+GreenThread uses API keys for authenticating inference requests. All keys follow the `gthread_` prefix format and are passed as Bearer tokens.
+
+## API key format
+
+Keys are prefixed with `gthread_` followed by a random string:
+
+```
+gthread_a1b2c3d4e5f6g7h8i9j0...
+```
+
+## Using your API key
+
+Include the key in the `Authorization` header:
+
+```bash
+curl https://your-host:8080/v1/chat/completions \
+  -H "Authorization: Bearer gthread_your_api_key" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "meta-llama/Llama-3.1-8B-Instruct", "messages": [{"role": "user", "content": "Hello"}]}'
+```
+
+With the OpenAI Python SDK:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="https://your-host:8080/v1",
+    api_key="gthread_your_api_key",
+)
+```
+
+## Key management API
+
+<ApiEndpoint method="GET" path="/api/keys" />
+
+List all API keys. Returns key metadata without exposing the full key value.
+
+```json
+{
+  "keys": [
+    {
+      "key": "gthread_a1b2...xxxx",
+      "name": "Production",
+      "created_at": 1700000000
+    }
+  ]
+}
+```
+
+<ApiEndpoint method="POST" path="/api/keys" />
+
+Create a new API key.
+
+**Request:**
+
+```json
+{
+  "name": "My API Key"
+}
+```
+
+**Response:**
+
+```json
+{
+  "key": "gthread_newly_generated_key_value",
+  "name": "My API Key",
+  "created_at": 1700000000
+}
+```
+
+<Callout type="warning" title="Save your key">
+The full key is only returned once at creation time. Store it securely — it cannot be retrieved later.
+</Callout>
+
+<ApiEndpoint method="DELETE" path="/api/keys/:key" />
+
+Revoke an API key. Requests using this key will immediately begin returning `401 Unauthorized`.
+
+## Usage tracking
+
+Each API key is tracked independently for usage metrics. The `APIKeyID` is attached to every inference request, enabling per-key billing and usage reports. See [Metrics & Usage](/metrics-usage) for details.

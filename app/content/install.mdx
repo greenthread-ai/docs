@@ -1,0 +1,107 @@
+import { Callout } from '../components/callout'
+
+Once the [prerequisites](/prerequisites) are in place, install GreenThread with a single command.
+
+## Run the installer
+
+```bash
+curl -sSL https://licence.greenthread.ai/api/v1/platform/install.sh | \
+  GTHREAD_LICENCE_TOKEN=gthread_your_key_here sudo -E bash -- \
+  --models-dir /ephemeral/models
+```
+
+The installer will:
+
+1. Validate your licence key
+2. Download the latest GreenThread binaries
+3. Set up a Python virtual environment with dependencies
+4. Create systemd services for automatic startup
+5. Start GreenThread
+
+<Callout type="info" title="Model cache directory">
+The `--models-dir` flag sets where model weights are stored on disk. Use a fast storage volume with enough space for your models. `/ephemeral/models` is recommended for cloud instances with local SSD storage. If omitted, the default is `/opt/gthread/models`.
+</Callout>
+
+## Verify the installation
+
+Check that both services are running:
+
+```bash
+systemctl status gthread-engine gthread-storage
+```
+
+Test the API:
+
+```bash
+curl http://localhost:8080/health
+```
+
+You should see a healthy response:
+
+```json
+{
+  "status": "healthy",
+  "components": {
+    "engine": {"status": "healthy"},
+    "storage": {"status": "healthy"},
+    "licence": {"status": "healthy"},
+    "models": {"status": "healthy", "message": "No models loaded"}
+  }
+}
+```
+
+## Viewing logs
+
+```bash
+# Engine logs
+journalctl -u gthread-engine -f
+
+# Storage server logs
+journalctl -u gthread-storage -f
+```
+
+## Configuration files
+
+After installation, configuration files are located at:
+
+| File | Purpose |
+|------|---------|
+| `/opt/gthread/config/engine.env` | Engine environment variables |
+| `/opt/gthread/config/storage.env` | Storage server environment variables |
+| `/opt/gthread/config/config.json` | Engine settings (timeouts, queue limits) |
+
+To apply configuration changes, restart the services:
+
+```bash
+sudo systemctl restart gthread-engine gthread-storage
+```
+
+## Directory structure
+
+```
+/opt/gthread/
+├── current/              # Symlink to the active version
+│   ├── bin/              # GreenThread binaries
+│   └── venv/             # Python virtual environment
+├── config/               # Configuration files
+│   ├── engine.env
+│   ├── storage.env
+│   └── config.json
+└── models/               # Model cache (or your --models-dir path)
+```
+
+## Offline deployments
+
+For air-gapped environments without internet access, contact your GreenThread account team for an offline licence. Set it as an environment variable instead of the token:
+
+```bash
+export GTHREAD_OFFLINE_LICENCE="eyJhbGciOiJFZERTQSJ9..."
+```
+
+Offline licences are valid for a fixed period (typically 6-12 months) and do not require connectivity to the licence server.
+
+## Next steps
+
+- [Authentication](/authentication) — Create API keys for your applications
+- [Adding & Removing Models](/adding-removing-models) — Deploy your first model
+- [Model Configuration](/model-configuration) — Tune inference settings for your hardware

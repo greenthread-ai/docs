@@ -1,0 +1,153 @@
+import { ApiEndpoint } from '../components/api-endpoint'
+import { Callout } from '../components/callout'
+
+The Batch API lets you submit large sets of inference requests for asynchronous processing. It follows the OpenAI Batch API format — upload a JSONL file of requests, create a batch, and retrieve results when complete.
+
+## Workflow
+
+1. Upload a JSONL input file containing your requests
+2. Create a batch referencing the uploaded file
+3. Poll for completion (or use the events API)
+4. Download results from the output file
+
+## Upload input file
+
+<ApiEndpoint method="POST" path="/v1/files" />
+
+Upload a JSONL file where each line is a request object:
+
+```json
+{"custom_id": "req-1", "method": "POST", "url": "/v1/chat/completions", "body": {"model": "meta-llama/Llama-3.1-8B-Instruct", "messages": [{"role": "user", "content": "Hello"}], "max_tokens": 100}}
+{"custom_id": "req-2", "method": "POST", "url": "/v1/chat/completions", "body": {"model": "meta-llama/Llama-3.1-8B-Instruct", "messages": [{"role": "user", "content": "World"}], "max_tokens": 100}}
+```
+
+Each line must contain:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `custom_id` | string | Your unique identifier for this request |
+| `method` | string | Always `"POST"` |
+| `url` | string | The endpoint path, e.g. `"/v1/chat/completions"` |
+| `body` | object | The request payload |
+
+**Response:**
+
+```json
+{
+  "id": "file-abc123",
+  "object": "file",
+  "bytes": 1234,
+  "created_at": 1700000000,
+  "filename": "batch_input.jsonl",
+  "purpose": "batch"
+}
+```
+
+## Create batch
+
+<ApiEndpoint method="POST" path="/v1/batches" />
+
+**Request:**
+
+```json
+{
+  "input_file_id": "file-abc123",
+  "endpoint": "/v1/chat/completions",
+  "completion_window": "24h",
+  "metadata": {
+    "description": "nightly evaluation run"
+  }
+}
+```
+
+**Response:**
+
+```json
+{
+  "id": "batch-xyz789",
+  "object": "batch",
+  "endpoint": "/v1/chat/completions",
+  "input_file_id": "file-abc123",
+  "status": "validating",
+  "created_at": 1700000000,
+  "request_counts": {
+    "total": 2,
+    "completed": 0,
+    "failed": 0
+  }
+}
+```
+
+## Check batch status
+
+<ApiEndpoint method="GET" path="/v1/batches/:batch_id" />
+
+Poll this endpoint to track progress. The batch moves through these statuses:
+
+| Status | Description |
+|--------|-------------|
+| `validating` | Input file being validated |
+| `in_progress` | Requests being processed |
+| `finalizing` | Writing output file |
+| `completed` | All requests processed, output ready |
+| `failed` | Batch failed during processing |
+| `expired` | Batch exceeded completion window |
+| `cancelling` | Cancel in progress |
+| `cancelled` | Batch was cancelled |
+
+## List batches
+
+<ApiEndpoint method="GET" path="/v1/batches" />
+
+Returns all batches with pagination.
+
+## Retrieve results
+
+When `status` is `completed`, the `output_file_id` field contains the ID of the results file.
+
+<ApiEndpoint method="GET" path="/v1/files/:file_id/content" />
+
+The output is a JSONL file where each line contains:
+
+```json
+{
+  "id": "resp-001",
+  "custom_id": "req-1",
+  "response": {
+    "status_code": 200,
+    "request_id": "req-abc",
+    "body": {
+      "id": "chatcmpl-xyz",
+      "object": "chat.completion",
+      "choices": [{"index": 0, "message": {"role": "assistant", "content": "..."}, "finish_reason": "stop"}],
+      "usage": {"prompt_tokens": 10, "completion_tokens": 50, "total_tokens": 60}
+    }
+  }
+}
+```
+
+Failed requests include an `error` field instead of `response`.
+
+## Cancel a batch
+
+<ApiEndpoint method="POST" path="/v1/batches/:batch_id/cancel" />
+
+Cancels an in-progress batch. Requests already completed are preserved in the output file.
+
+## Delete a file
+
+<ApiEndpoint method="DELETE" path="/v1/files/:file_id" />
+
+Remove an uploaded or output file.
+
+## Configuration
+
+Batch processing behavior is controlled by these settings:
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `min_batch_size` | 10 | Minimum requests before submission |
+| `max_wait_time_sec` | 1800 (30 min) | Max wait before processing |
+| `submit_interval_sec` | 60 | Check interval for ready batches |
+| `retention_days` | 7 | Days to keep completed results |
+| `max_concurrency` | 32 | Max concurrent requests per batch |

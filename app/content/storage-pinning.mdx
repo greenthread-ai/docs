@@ -1,0 +1,104 @@
+import { ApiEndpoint } from '../components/api-endpoint'
+import { Callout } from '../components/callout'
+
+GreenThread uses a tiered storage system for model weights. Where weights are stored determines how fast a model can wake up.
+
+## Storage tiers
+
+| Tier | Medium | Wake Time (20B) | Description |
+|------|--------|-----------------|-------------|
+| **System RAM** | CPU memory | ~1.8 seconds | Weights held in memory for fast GPU transfer |
+| **Disk** | SSD | ~30-40 seconds | Weights loaded from disk before GPU transfer |
+
+System RAM provides dramatically faster wake times because weights can be transferred directly to GPU at ~25 GB/s.
+
+## Configuring storage tier
+
+Set the staging tier when adding a model:
+
+```json
+{
+  "backend_name": "llama-3-8b",
+  "model_name": "meta-llama/Llama-3.1-8B-Instruct",
+  "staging_tier": "system",
+  "staging_pinned": true
+}
+```
+
+| Field | Values | Default | Description |
+|-------|--------|---------|-------------|
+| `staging_tier` | `"disk"`, `"system"` | `"disk"` | Where to pre-stage model tensors |
+| `staging_pinned` | `true`, `false` | `false` | Prevent eviction from the staging tier |
+
+## Pinning
+
+Pinned models are guaranteed to stay in their storage tier and won't be evicted to make room for other models.
+
+- **Pinned in system RAM**: Model weights are always available in CPU memory. Wake is always fast (~1.8s for 20B).
+- **Pinned on disk**: Model weights are kept on local disk. Wake requires a disk read but the model won't be evicted from local storage.
+- **Unpinned**: The storage server may evict weights from system RAM to disk under memory pressure, or from disk to free space.
+
+<Callout type="tip" title="When to pin">
+Pin your most latency-sensitive models in system RAM. For models that are rarely accessed or where ~30s wake time is acceptable, use disk tier to conserve RAM.
+</Callout>
+
+## Staging API
+
+The staging API lets you manage which storage tier a model's weights are stored in and query staging status.
+
+### Set model staging tier
+
+<ApiEndpoint method="POST" path="/api/models/:modelName/staging" />
+
+Set or change the storage tier for a specific model's weights.
+
+```json
+{
+  "tier": "system",
+  "pin": true
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `tier` | string | `"system"` (RAM) or `"disk"` |
+| `pin` | boolean | Whether to pin the model in this tier (prevent eviction) |
+
+### Get model staging status
+
+<ApiEndpoint method="GET" path="/api/models/:modelName/staging" />
+
+Returns the current staging status for a specific model.
+
+### List staged models
+
+<ApiEndpoint method="GET" path="/api/staging/models" />
+
+List all models staged at a specific tier.
+
+**Query parameters:**
+
+| Parameter | Values | Description |
+|-----------|--------|-------------|
+| `tier` | `"system"`, `"disk"`, `"all"` | Filter by storage tier (defaults to all) |
+
+### Staging stats
+
+<ApiEndpoint method="GET" path="/api/staging/stats" />
+
+Returns aggregate storage tier statistics — total capacity, usage, and model counts per tier.
+
+## Peer storage
+
+In multi-node deployments, GreenThread can fetch model weights from peer nodes in the cluster. If a model's weights aren't available locally, the storage server can pull them from a peer that has them cached, avoiding a full download from the model registry.
+
+## Wake time implications
+
+The storage tier directly impacts user-perceived latency for the first request to a sleeping model:
+
+- **System RAM + pinned**: Consistent ~1.8s wake. Best for production workloads.
+- **System RAM + unpinned**: Usually ~1.8s, but may fall back to disk if RAM is full.
+- **Disk + pinned**: Consistent ~30-40s wake. Acceptable for dev/staging.
+- **Disk + unpinned**: ~30-40s if cached, longer if weights need to be re-downloaded.
+
+Plan your tier assignments based on your latency requirements and available system RAM.

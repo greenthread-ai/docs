@@ -1,0 +1,83 @@
+import { Mermaid } from '../components/mermaid'
+
+GreenThread is a GPU inference platform that lets you serve dozens of large language models on a single node by intelligently swapping them in and out of GPU memory. Instead of dedicating GPUs to individual models, GreenThread keeps sleeping models resident in CPU memory and wakes them on demand — in under 2 seconds.
+
+## How it works
+
+GreenThread sits between your application and the inference backends. When a request arrives for a model:
+
+1. If the model is **serving**, the request is forwarded directly — no overhead.
+2. If the model is **sleeping**, GreenThread wakes it by restoring weights from CPU cache to GPU, then forwards the request.
+3. If GPUs are full, the platform's [fairness policy](/fairness-policy) preempts the least-recently-used model to make room.
+
+All of this happens transparently behind an OpenAI-compatible API.
+
+## Architecture
+
+<Mermaid chart={`
+flowchart LR
+    Client["Client\n(OpenAI SDK)"] --> API["HTTP API"]
+    API --> Controller["Controller"]
+    Controller --> B1["Inference\nBackend"]
+    Controller --> B2["Inference\nBackend"]
+    Controller --> Storage["Storage\nServer"]
+    Storage --> RAM["CPU Cache"]
+    Storage --> Disk["Disk"]
+    B1 --> GPU1["GPU 0"]
+    B2 --> GPU2["GPU 1"]
+`} />
+
+| Component | Purpose |
+|-----------|---------|
+| HTTP API | OpenAI-compatible endpoints on port 8080 |
+| Controller | Model registry, state machine, GPU scheduling |
+| Storage Server | Weight caching, memory management, checkpoint storage |
+| Inference Backend | Model execution with custom loader for fast sleep/wake |
+
+## Performance
+
+For a 20B-parameter model:
+
+| Operation | Time |
+|-----------|------|
+| Traditional cold start | ~40 seconds |
+| GreenThread wake (from RAM) | ~1.8 seconds |
+| GreenThread sleep | ~90 milliseconds |
+
+This ~22x improvement comes from keeping the inference runtime alive while sleeping and storing weights in CPU memory for fast GPU transfers.
+
+## API compatibility
+
+GreenThread exposes an OpenAI-compatible API. Any SDK or tool that works with OpenAI's API works with GreenThread:
+
+- `POST /v1/chat/completions` — Chat completions with streaming
+- `POST /v1/completions` — Text completions
+- `GET /v1/models` — List available models with status
+
+## Quickstart
+
+Point your OpenAI SDK at your GreenThread instance:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="https://your-greenthread-host:8080/v1",
+    api_key="gthread_your_api_key",
+)
+
+response = client.chat.completions.create(
+    model="meta-llama/Llama-3.1-8B-Instruct",
+    messages=[{"role": "user", "content": "Hello!"}],
+)
+print(response.choices[0].message.content)
+```
+
+If the model is sleeping, GreenThread will automatically wake it, serve the request, and return the response — all behind the standard API.
+
+## Next steps
+
+- [Authentication](/authentication) — Set up API keys
+- [Inference API](/inference-api) — Full endpoint reference
+- [Model Configuration](/model-configuration) — Tune inference settings
+- [Adding & Removing Models](/adding-removing-models) — Manage your model fleet

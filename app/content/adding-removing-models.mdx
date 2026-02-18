@@ -1,0 +1,105 @@
+import { ApiEndpoint } from '../components/api-endpoint'
+import { Callout } from '../components/callout'
+
+Models are managed through a REST API. You can add, update, and remove models at runtime without restarting GreenThread.
+
+## Add a model
+
+<ApiEndpoint method="POST" path="/api/models/add" />
+
+Deploy a new model to the cluster.
+
+**Request:**
+
+```json
+{
+  "backend_type": "vllm",
+  "backend_name": "llama-3-8b",
+  "model_name": "meta-llama/Llama-3.1-8B-Instruct",
+  "tensor_parallel_size": 1,
+  "vllm_config": {
+    "gpu_memory_utilization": 0.9,
+    "max_model_len": 8192
+  }
+}
+```
+
+**Required fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `backend_type` | string | Always `"vllm"` |
+| `backend_name` | string | Unique identifier for this backend |
+| `model_name` | string | HuggingFace model identifier |
+
+**Optional fields:**
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `tensor_parallel_size` | int | `1` | Number of GPUs for tensor parallelism |
+| `pinned_gpu_indices` | int[] | auto | Pin model to specific GPU indices |
+| `popular` | bool | `false` | Protect from preemption |
+| `staging_tier` | string | `"disk"` | Storage tier: `"disk"` or `"system"` |
+| `staging_pinned` | bool | `false` | Pin tensors at staging tier |
+| `vllm_config` | object | — | Inference engine settings (see [Model Configuration](/model-configuration)) |
+
+## Update a model
+
+<ApiEndpoint method="PUT" path="/api/models/update" />
+
+Update an existing model's configuration. The model will be restarted with the new settings.
+
+**Request:** Same schema as add, with `backend_name` identifying the model to update.
+
+## Delete a model
+
+<ApiEndpoint method="DELETE" path="/api/models/delete" />
+
+Remove a model from the cluster.
+
+**Request:**
+
+```json
+{
+  "backend_name": "llama-3-8b"
+}
+```
+
+This stops the inference process, releases GPU memory, and removes the model from the registry.
+
+## Mark as popular
+
+<ApiEndpoint method="POST" path="/api/models/set_popular" />
+
+Toggle the popular flag on a model. Popular models are protected from preemption and automatically restored if displaced.
+
+**Request:**
+
+```json
+{
+  "backend_name": "llama-3-8b",
+  "popular": true
+}
+```
+
+See [Fairness Policy](/fairness-policy) for details on how popular model protection works.
+
+## Validation rules
+
+GreenThread validates model configuration before deployment:
+
+- `backend_name` must be unique across the cluster
+- `model_name` must be a valid HuggingFace model identifier
+- `tensor_parallel_size` must be 1, 2, 4, or 8
+- `pinned_gpu_indices` must match `tensor_parallel_size` in length, with no duplicate indices
+- `gpu_memory_utilization` must be between 0.1 and 1.0
+- `quantization` must be one of: `awq`, `gptq`, `fp8`, `marlin`, `squeezellm`
+- `max_lora_rank` must be between 1 and 512
+
+<Callout type="info" title="GPU allocation">
+If `pinned_gpu_indices` is not specified, GreenThread automatically allocates GPUs based on available memory and existing model placement.
+</Callout>
+
+## Model configuration schema
+
+For the full `vllm_config` reference, see [Model Configuration](/model-configuration).

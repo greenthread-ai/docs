@@ -1,0 +1,30 @@
+GreenThread runs on bare-metal Ubuntu servers with NVIDIA datacenter GPUs.
+
+## Hardware
+
+- **GPUs**: NVIDIA datacenter GPUs (A100, H100, L40S, etc.)
+- **System RAM**: Enough to cache model weights for fast wake — at minimum, match your total GPU VRAM
+- **Storage**: Local NVMe drives for the model cache directory — one drive per GPU recommended
+
+## Software
+
+- **OS**: Ubuntu 24.04 LTS (required)
+- **NVIDIA driver**: Version 590 or later
+- **GPU Direct Storage**: Required for high-throughput weight transfers
+- **Python**: 3.12 with development headers (`python3.12-dev`)
+- **Root access**: Installation requires `sudo`
+
+## Licence key
+
+You need a GreenThread licence key to install and run the platform. Keys use the format `gthread_xxx` and are issued by your GreenThread account team.
+
+Contact [sales@greenthread.ai](mailto:sales@greenthread.ai) to get started.
+
+## Network
+
+GreenThread listens on port **8080** by default. Ensure this port is accessible to your application clients.
+
+During installation and model downloads, outbound HTTPS access is required to:
+
+- `licence.greenthread.ai` — licence validation and installer
+- `huggingface.co` — model weight downloads

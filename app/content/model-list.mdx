@@ -1,0 +1,104 @@
+import { ApiEndpoint } from '../components/api-endpoint'
+import { Callout } from '../components/callout'
+
+GreenThread provides multiple ways to list and query models. The top-level `/v1/models` endpoint is OpenAI-compatible, while model-specific endpoints let you target individual backends directly.
+
+## List all models
+
+<ApiEndpoint method="GET" path="/v1/models" />
+
+Returns all models with their current state. Compatible with the OpenAI model list endpoint.
+
+```json
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "llama-3-8b/meta-llama/Meta-Llama-3-8B-Instruct",
+      "model_name": "meta-llama/Meta-Llama-3-8B-Instruct",
+      "backend_name": "llama-3-8b",
+      "object": "model",
+      "created": 0,
+      "owned_by": "engine",
+      "status": "serving"
+    }
+  ]
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | string | Format: `{backend_name}/{model_name}` |
+| `model_name` | string | HuggingFace model identifier |
+| `backend_name` | string | Unique backend identifier used for routing and management |
+| `status` | string | Current model state (see [Model States](/model-states)) |
+| `error` | string | Error message (only present when status is `"error"`) |
+
+<Callout type="tip" title="OpenAI SDK compatible">
+The standard OpenAI SDK `client.models.list()` call works against this endpoint. Use it to discover available models and check their status before sending requests.
+</Callout>
+
+## Model-specific endpoints
+
+These endpoints target a specific model by its `backend_name` in the URL, bypassing the `model` field routing used by the standard `/v1/*` endpoints.
+
+### Query a model's backend
+
+<ApiEndpoint method="GET" path="/api/models/:model_id/v1/models" />
+
+Proxies directly to the underlying inference backend's `/v1/models` endpoint for a specific model. Returns the model list as reported by the backend, including any loaded LoRA adapters.
+
+This does **not** wake the model — the backend can respond even when the model is sleeping.
+
+```bash
+curl https://your-host:8080/api/models/llama-3-8b/v1/models \
+  -H "Authorization: Bearer gthread_xxx"
+```
+
+### Chat completions (by model)
+
+<ApiEndpoint method="POST" path="/api/models/:model_id/v1/chat/completions" />
+
+Proxies a chat completion request to a specific model's backend. The `model` field in the request body is ignored — the target model is determined by the `:model_id` in the URL. If the model is sleeping, it will be woken automatically.
+
+```bash
+curl -X POST https://your-host:8080/api/models/llama-3-8b/v1/chat/completions \
+  -H "Authorization: Bearer gthread_xxx" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [{"role": "user", "content": "Hello"}],
+    "max_tokens": 128
+  }'
+```
+
+The response format is identical to the standard `/v1/chat/completions` endpoint, including streaming support.
+
+### Model health
+
+<ApiEndpoint method="GET" path="/api/models/:model_id/health" />
+
+Returns health status for a specific model.
+
+- `200` — Model exists and is not in error state
+- `404` — Model not found
+- `503` — Model is in error state
+
+```json
+{
+  "backend_name": "llama-3-8b",
+  "model_name": "meta-llama/Meta-Llama-3-8B-Instruct",
+  "status": "serving",
+  "healthy": true,
+  "timestamp": "2025-11-25T12:00:00Z"
+}
+```
+
+## When to use model-specific endpoints
+
+The standard `/v1/chat/completions` endpoint routes by the `model` field in the request body, matching against `model_name`. The model-specific `/api/models/:model_id/v1/chat/completions` endpoint routes by `backend_name` in the URL.
+
+Use model-specific endpoints when:
+
+- You have multiple backends serving the same `model_name` (e.g. different quantizations of the same model)
+- You want explicit control over which backend handles a request
+- You need to health-check or query a specific backend directly

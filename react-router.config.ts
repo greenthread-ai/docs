@@ -1,7 +1,30 @@
 import type { Config } from "@react-router/dev/config";
 
+const slugs = [
+  "getting-started",
+  "authentication",
+  "inference-api",
+  "model-list",
+  "lora-adapters",
+  "batch-api",
+  "adding-removing-models",
+  "model-states",
+  "sleep-wake",
+  "fairness-policy",
+  "storage-pinning",
+  "metrics-usage",
+  "real-time-events",
+  "model-configuration",
+  "requirements",
+  "prerequisites",
+  "install",
+  "troubleshooting",
+];
+
 export default {
-  // Config options...
-  // Server-side render by default, to enable SPA mode set this to `false`
-  ssr: true,
+  ssr: false,
+  basename: "/",
+  async prerender() {
+    return slugs.map((s) => `/${s}`);
+  },
 } satisfies Config;

@@ -1,0 +1,113 @@
+import { ApiEndpoint } from '../components/api-endpoint'
+import { Callout } from '../components/callout'
+
+GreenThread exposes metrics through both a Prometheus-compatible endpoint and JSON APIs for usage tracking and billing.
+
+## Prometheus metrics
+
+<ApiEndpoint method="GET" path="/metrics" />
+
+Standard Prometheus scrape endpoint. Returns all metric families in Prometheus exposition format.
+
+Key metrics include:
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `gthread_model_status` | Gauge | Current model state (labeled by backend_name) |
+| `gthread_gpu_memory_used_bytes` | Gauge | GPU memory usage per device |
+| `gthread_gpu_memory_total_bytes` | Gauge | Total GPU memory per device |
+| `gthread_gpu_utilization_percent` | Gauge | GPU compute utilization |
+| `gthread_gpu_temperature_celsius` | Gauge | GPU temperature |
+| `gthread_inference_requests_total` | Counter | Total inference requests (labeled by model, status) |
+| `gthread_inference_duration_seconds` | Histogram | Request duration distribution |
+| `gthread_wake_duration_seconds` | Histogram | Model wake time distribution |
+| `gthread_sleep_duration_seconds` | Histogram | Model sleep time distribution |
+| `gthread_tokens_total` | Counter | Total tokens processed (prompt + completion) |
+| `gthread_queue_depth` | Gauge | Current request queue depth per model |
+
+Configure your Prometheus instance to scrape this endpoint:
+
+```yaml
+scrape_configs:
+  - job_name: greenthread
+    static_configs:
+      - targets: ["your-host:8080"]
+    scrape_interval: 15s
+```
+
+## JSON metrics APIs
+
+### System metrics
+
+<ApiEndpoint method="GET" path="/api/metrics/system" />
+
+Returns a snapshot of GPU and model metrics. See [Model States](/model-states#system-metrics) for the full response schema.
+
+### Usage metrics
+
+<ApiEndpoint method="GET" path="/api/metrics/usage" />
+
+Returns token-level usage data for billing. Supports filtering by time range, API key, and model.
+
+**Query parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `start` | ISO 8601 | Start of time range |
+| `end` | ISO 8601 | End of time range |
+| `api_key` | string | Filter by API key ID |
+| `model` | string | Filter by model name |
+| `granularity` | string | `"raw"`, `"hourly"`, or `"daily"` |
+
+**Example:**
+
+```bash
+curl "https://your-host:8080/api/metrics/usage?start=2025-01-01T00:00:00Z&end=2025-01-02T00:00:00Z&granularity=hourly"
+```
+
+### GPU history
+
+<ApiEndpoint method="GET" path="/api/metrics/gpu/history" />
+
+Returns historical GPU metrics over time — useful for dashboards and trend analysis.
+
+### Models with usage
+
+<ApiEndpoint method="GET" path="/api/metrics/models" />
+
+Returns the list of model names that have recorded usage data. Useful for populating filter dropdowns in dashboards.
+
+### Swap metrics
+
+<ApiEndpoint method="GET" path="/api/metrics/swap" />
+
+Returns sleep/wake operation metrics — counts, durations, and failure rates.
+
+## Usage tracking
+
+Every inference request is tracked with:
+
+- **API key ID** — Which key made the request
+- **Model name** — Which model was used
+- **Token counts** — Prompt tokens, completion tokens, total tokens
+- **Timestamp** — When the request was processed
+- **Duration** — How long the request took
+
+Records are stored in an embedded key-value store with time-indexed keys for efficient range queries.
+
+## Aggregation
+
+Usage data is automatically aggregated at two levels:
+
+- **Hourly** — Token counts and request counts per hour, per API key, per model
+- **Daily** — Same metrics rolled up by day
+
+Use the `granularity` parameter on the usage API to select the aggregation level. Raw records provide the most detail but are larger.
+
+## Retention
+
+Usage records follow a configurable retention policy. Old records are automatically deleted based on the `retention_days` setting (default: 7 days for batch results, configurable for usage data).
+
+<Callout type="tip" title="Export for billing">
+For production billing, scrape the usage API periodically and store results in your own data warehouse. The hourly granularity provides a good balance between detail and volume.
+</Callout>

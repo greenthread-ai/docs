@@ -1,0 +1,127 @@
+import { ApiEndpoint } from '../components/api-endpoint'
+import { Callout } from '../components/callout'
+import { Mermaid } from '../components/mermaid'
+
+GreenThread supports serving LoRA adapters on top of base models with on-demand loading and automatic caching. Adapters are loaded lazily on first request and cached on the node for subsequent use.
+
+## How it works
+
+LoRA adapter loading uses a cache-on-demand pattern:
+
+1. You send an inference request with `lora_adapter_metadata` specifying the adapter.
+2. If the adapter is **not cached** on the node, the API returns a `404`.
+3. Your proxy catches the 404, generates signed URLs for the adapter files, and retries with the `files` array.
+4. GreenThread downloads the adapter, caches it, and serves the request.
+5. Subsequent requests for the same adapter and `hash` are served from cache instantly.
+
+<Mermaid chart={`
+flowchart TD
+    A["Client sends request\nwith lora_adapter_metadata"] --> B{"Adapter\ncached?"}
+    B -- Yes --> C["200 OK\nServe from cache"]
+    B -- No --> D["404 Not Found"]
+    D --> E["Proxy generates\nsigned URLs"]
+    E --> F["Retry with files[] included"]
+    F --> G["GreenThread downloads\n& caches adapter"]
+    G --> C
+    C --> H["Subsequent requests\nserved instantly"]
+`} />
+
+This means no upfront provisioning, no unnecessary S3 operations, and no per-request latency penalty once cached.
+
+## Request format
+
+Add the `lora_adapter_metadata` field alongside your normal request body on the standard `/v1/chat/completions` and `/v1/completions` endpoints.
+
+### `lora_adapter_metadata` schema
+
+```json
+{
+  "lora_adapter_metadata": {
+    "lora_model": {
+      "id": "string (required)",
+      "name": "string (required)",
+      "hash": "string (recommended)",
+      "files": ["string (optional)"]
+    }
+  }
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `id` | string | Yes | Unique identifier, used as the cache key |
+| `name` | string | Yes | Display name, returned as the `model` field in responses |
+| `hash` | string | Recommended | Version identifier for cache invalidation |
+| `files` | string[] | Conditional | URLs to adapter files. Required on retry after a 404 |
+
+## Integration pattern
+
+The recommended pattern is a try/catch in your proxy layer:
+
+```python
+def inference_with_lora(prompt, adapter):
+    payload = {
+        "model": "meta-llama/Llama-3.1-8B-Instruct",
+        "messages": [{"role": "user", "content": prompt}],
+        "lora_adapter_metadata": {
+            "lora_model": {
+                "id": adapter.id,
+                "name": adapter.name,
+                "hash": str(adapter.updated_at),
+            }
+        }
+    }
+
+    response = requests.post(GREENTHREAD_URL, json=payload)
+
+    if response.status_code == 404:
+        # Adapter not cached — add signed file URLs and retry
+        payload["lora_adapter_metadata"]["lora_model"]["files"] = [
+            generate_signed_url(f) for f in adapter.file_keys
+        ]
+        response = requests.post(GREENTHREAD_URL, json=payload)
+
+    return response.json()
+```
+
+## Cache invalidation
+
+The `hash` field controls cache invalidation. When GreenThread receives a request where the `hash` differs from what is cached:
+
+1. The existing cached adapter is invalidated.
+2. If `files` are provided, the new version is downloaded and cached.
+3. If `files` are not provided, a 404 is returned (triggering your retry flow).
+
+<Callout type="tip" title="Use timestamps as hashes">
+Set `hash` to your adapter's `updated_at` timestamp. Whenever you retrain, the new timestamp naturally invalidates the old cache.
+</Callout>
+
+If `hash` is omitted, the cached adapter is used indefinitely.
+
+## Adapter file requirements
+
+LoRA adapters must include:
+
+- `adapter_config.json` — HuggingFace PEFT configuration
+- `adapter_model.safetensors` — Adapter weights in safetensors format
+
+Any LoRA adapter trained with PEFT and exported in this format is compatible.
+
+## Configuration
+
+LoRA support is configured at the model level:
+
+| Setting | Description | Default |
+|---------|-------------|---------|
+| `enable_lora` | Enable LoRA adapter support | `false` |
+| `max_lora_rank` | Maximum LoRA rank supported (1–512) | `64` |
+
+The `max_lora_rank` must be equal to or greater than the rank of any adapter you intend to serve.
+
+## Error responses
+
+| HTTP Code | Error Type | Meaning |
+|-----------|-----------|---------|
+| `404` | `not_found` | Adapter not in cache, no `files` provided. Retry with URLs. |
+| `400` | `bad_request` | Missing required fields (`id` or `name`). |
+| `502` | `bad_gateway` | Failed to download adapter files from provided URLs. |

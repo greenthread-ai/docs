@@ -1,0 +1,139 @@
+import { ApiEndpoint } from '../components/api-endpoint'
+import { Callout } from '../components/callout'
+
+GreenThread exposes OpenAI-compatible inference endpoints. Any client library or tool that works with OpenAI's API works with GreenThread without modification.
+
+## Chat completions
+
+<ApiEndpoint method="POST" path="/v1/chat/completions" />
+
+Generate a chat completion. Supports multi-turn conversations and streaming.
+
+**Request:**
+
+```json
+{
+  "model": "meta-llama/Llama-3.1-8B-Instruct",
+  "messages": [
+    {"role": "system", "content": "You are a helpful assistant."},
+    {"role": "user", "content": "What is GreenThread?"}
+  ],
+  "temperature": 0.7,
+  "max_tokens": 512,
+  "stream": false
+}
+```
+
+**Response:**
+
+```json
+{
+  "id": "chatcmpl-abc123",
+  "object": "chat.completion",
+  "created": 1700000000,
+  "model": "meta-llama/Llama-3.1-8B-Instruct",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "GreenThread is a GPU inference platform..."
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 25,
+    "completion_tokens": 50,
+    "total_tokens": 75
+  }
+}
+```
+
+## Text completions
+
+<ApiEndpoint method="POST" path="/v1/completions" />
+
+Generate a text completion from a prompt string.
+
+**Request:**
+
+```json
+{
+  "model": "meta-llama/Llama-3.1-8B-Instruct",
+  "prompt": "The capital of France is",
+  "max_tokens": 32,
+  "temperature": 0
+}
+```
+
+## Streaming
+
+Set `"stream": true` to receive Server-Sent Events as the model generates tokens:
+
+```bash
+curl https://your-host:8080/v1/chat/completions \
+  -H "Authorization: Bearer gthread_xxx" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "meta-llama/Llama-3.1-8B-Instruct",
+    "messages": [{"role": "user", "content": "Hello"}],
+    "stream": true
+  }'
+```
+
+Each SSE event contains a chunk:
+
+```
+data: {"id":"chatcmpl-abc123","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-abc123","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"!"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-abc123","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+```
+
+## Auto-wake behavior
+
+If a model is sleeping when a request arrives, GreenThread automatically wakes it:
+
+1. The request is queued (up to 5,000 per model by default).
+2. The model transitions through `pending` → `activating` → `serving`.
+3. Once serving, queued requests are processed in order.
+
+The client sees slightly higher latency for the first request (~1.8s from RAM, ~30-40s from disk) but doesn't need any special handling — the response arrives normally.
+
+<Callout type="tip" title="Pre-warming">
+Use `POST /api/wake` to proactively wake models before traffic arrives. This eliminates first-request latency for predictable workloads.
+</Callout>
+
+## Model routing
+
+Requests are routed by the `model` field in the request body. GreenThread matches this against the `model_name` configured for each backend.
+
+## Error responses
+
+| Status | Meaning |
+|--------|---------|
+| `400` | Invalid request body or parameters |
+| `401` | Missing or invalid API key |
+| `404` | Model not found |
+| `429` | Request queue full (model overloaded) |
+| `502` | Backend error (inference process failed) |
+| `503` | Model in error state |
+| `504` | Request timeout |
+
+Error responses follow the OpenAI error format:
+
+```json
+{
+  "error": {
+    "message": "Model not found: my-model",
+    "type": "not_found",
+    "code": 404
+  }
+}
+```
+
+See [Model List & Routing](/model-list) for model listing, model-specific proxy endpoints, and per-backend health checks.

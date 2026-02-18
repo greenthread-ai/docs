@@ -1,0 +1,166 @@
+import { Callout } from '../components/callout'
+
+The `vllm_config` object controls how the inference engine runs your model. These settings are passed when [adding a model](/adding-removing-models) and affect GPU memory usage, sequence length, quantization, and inference behavior.
+
+## Full schema
+
+```json
+{
+  "vllm_config": {
+    "gpu_memory_utilization": 0.9,
+    "max_model_len": 8192,
+    "quantization": "",
+    "enable_lora": false,
+    "max_lora_rank": 64,
+    "enforce_eager": false,
+    "max_num_seqs": null,
+    "load_format": "auto",
+    "chat_template": "",
+    "extra_args": []
+  }
+}
+```
+
+## Basic options
+
+### GPU memory utilization
+
+```json
+"gpu_memory_utilization": 0.9
+```
+
+Fraction of GPU memory the inference engine is allowed to use. Range: `0.1` to `1.0`. Default: `0.9`.
+
+Lower values leave more room for other models on the same GPU (multi-tenant mode). Higher values allow larger KV caches and longer sequences.
+
+| Value | Use case |
+|-------|----------|
+| `0.5 – 0.7` | Multi-tenant, multiple small models per GPU |
+| `0.85 – 0.95` | Single model, maximize throughput |
+
+### Max model length
+
+```json
+"max_model_len": 8192
+```
+
+Maximum sequence length (prompt + completion tokens). If not set, the engine uses the model's default context length.
+
+Reducing this value decreases KV cache memory usage, allowing the model to fit on smaller GPUs or alongside other models.
+
+### Quantization
+
+```json
+"quantization": "awq"
+```
+
+Weight quantization method. Must match how the model was quantized. Supported values:
+
+| Method | Description |
+|--------|-------------|
+| `awq` | Activation-aware weight quantization |
+| `gptq` | Post-training quantization |
+| `fp8` | FP8 quantization |
+| `marlin` | Marlin kernel quantization |
+| `squeezellm` | SqueezeLLM quantization |
+
+Leave empty for full-precision models.
+
+## LoRA settings
+
+### Enable LoRA
+
+```json
+"enable_lora": true
+```
+
+Enables LoRA adapter support for this model. See [LoRA Adapters](/lora-adapters) for usage details.
+
+### Max LoRA rank
+
+```json
+"max_lora_rank": 64
+```
+
+Maximum LoRA rank supported. Range: `1` to `512`. Default: `64`. Must be ≥ the rank of any adapter you plan to serve.
+
+## Advanced options
+
+### Enforce eager mode
+
+```json
+"enforce_eager": true
+```
+
+Disables graph optimization. Useful for debugging or when graph compilation causes issues. Increases memory efficiency at the cost of some throughput.
+
+### Max concurrent sequences
+
+```json
+"max_num_seqs": 256
+```
+
+Maximum number of sequences that can be processed concurrently. Limits batching to control memory usage and latency.
+
+### Load format
+
+```json
+"load_format": "auto"
+```
+
+How model weights are loaded. Values: `auto`, `pt`, `safetensors`, `gthread`.
+
+The `gthread` format enables the fast sleep/wake cycle using the custom model loader. This is set automatically when sleep/wake is available.
+
+### Chat template
+
+```json
+"chat_template": "/path/to/template.jinja2"
+```
+
+Custom Jinja2 chat template. Can be a file path or inline template string. Overrides the model's default chat template.
+
+### Extra args
+
+```json
+"extra_args": ["--disable-log-stats", "--max-log-len", "100"]
+```
+
+Raw CLI arguments passed directly to the inference engine. Use this as an escape hatch for engine options not covered by the schema.
+
+<Callout type="warning" title="Use with care">
+Extra args bypass validation. Invalid arguments will cause the inference process to fail on startup.
+</Callout>
+
+## Tensor parallelism
+
+Tensor parallelism is set at the model level (not inside `vllm_config`):
+
+```json
+{
+  "backend_name": "llama-70b",
+  "model_name": "meta-llama/Llama-3.1-70B-Instruct",
+  "tensor_parallel_size": 4,
+  "pinned_gpu_indices": [0, 1, 2, 3]
+}
+```
+
+| `tensor_parallel_size` | Use case |
+|-----------------------|----------|
+| `1` | Models ≤ 13B on a single GPU |
+| `2` | Models 13B–34B across 2 GPUs |
+| `4` | Models 34B–70B across 4 GPUs |
+| `8` | Models > 70B across 8 GPUs |
+
+If `pinned_gpu_indices` is provided, it must contain exactly `tensor_parallel_size` unique indices. Otherwise, GPUs are allocated automatically.
+
+## Validation rules
+
+The following rules are enforced when adding or updating a model:
+
+- `gpu_memory_utilization`: must be between 0.1 and 1.0
+- `quantization`: must be one of the supported methods or empty
+- `max_lora_rank`: must be between 1 and 512
+- `tensor_parallel_size`: must be 1, 2, 4, or 8
+- `pinned_gpu_indices`: count must match `tensor_parallel_size`, no duplicates
+- `extra_args`: each element must be a non-empty string

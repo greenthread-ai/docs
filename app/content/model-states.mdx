@@ -1,0 +1,201 @@
+import { ApiEndpoint } from '../components/api-endpoint'
+import { Mermaid } from '../components/mermaid'
+
+Models in GreenThread follow a state machine with seven states. Understanding these states helps you monitor your deployment and build integrations.
+
+## States
+
+| State | Description | VRAM Usage |
+|-------|-------------|------------|
+| `offline` | Container not started | None |
+| `sleeping` | Inference process running but dormant | ~300-400MB |
+| `pending` | Sleeping, waiting for GPU slot | ~300-400MB |
+| `activating` | Restoring tensors to GPU | Growing |
+| `serving` | Actively handling requests | Full allocation |
+| `deactivating` | Draining in-flight requests | Full allocation |
+| `error` | Startup or runtime failure | Variable |
+
+## State transitions
+
+<Mermaid chart={`
+stateDiagram-v2
+    [*] --> offline
+    offline --> sleeping: start
+    sleeping --> activating: wake (GPU available)
+    sleeping --> pending: wake (no GPU)
+    pending --> activating: GPU freed
+    activating --> serving: ready
+    serving --> deactivating: sleep request
+    deactivating --> sleeping: drained
+    serving --> sleeping: sleep (no in-flight)
+    activating --> sleeping: cancelled
+    sleeping --> offline: stop
+    serving --> error: failure
+    activating --> error: failure
+    offline --> error: start failure
+`} />
+
+The `error` state can occur from any state.
+
+## REST API endpoints
+
+### List models with status
+
+<ApiEndpoint method="GET" path="/v1/models" />
+
+Returns all models with their current state.
+
+```json
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "llama-3-8b/meta-llama/Meta-Llama-3-8B-Instruct",
+      "model_name": "meta-llama/Meta-Llama-3-8B-Instruct",
+      "backend_name": "llama-3-8b",
+      "object": "model",
+      "created": 0,
+      "owned_by": "engine",
+      "status": "serving"
+    }
+  ]
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | string | Format: `{backend_name}/{model_name}` |
+| `model_name` | string | HuggingFace model identifier |
+| `backend_name` | string | Unique backend identifier for routing |
+| `status` | string | Current state |
+| `error` | string | Error message (only when status is `"error"`) |
+
+### System health
+
+<ApiEndpoint method="GET" path="/health" />
+
+Returns overall system health with component-level detail.
+
+- `200` — Healthy or degraded
+- `503` — Unhealthy (critical component down)
+
+```json
+{
+  "status": "healthy",
+  "components": {
+    "engine": {"status": "healthy"},
+    "storage": {"status": "healthy"},
+    "licence": {"status": "healthy"},
+    "models": {"status": "healthy"}
+  },
+  "models": [
+    {"name": "meta-llama/Llama-3.1-8B-Instruct", "status": "serving"}
+  ],
+  "uptime_seconds": 3600.5,
+  "timestamp": "2025-11-25T12:00:00Z"
+}
+```
+
+### Model health
+
+<ApiEndpoint method="GET" path="/api/models/:model_id/health" />
+
+Health check for a specific model by its `backend_name`.
+
+- `200` — Model exists and is not in error state
+- `404` — Model not found
+- `503` — Model is in error state
+
+```json
+{
+  "backend_name": "llama-3-8b",
+  "model_name": "meta-llama/Meta-Llama-3-8B-Instruct",
+  "status": "serving",
+  "healthy": true,
+  "timestamp": "2025-11-25T12:00:00Z"
+}
+```
+
+### Wake a model
+
+<ApiEndpoint method="POST" path="/api/wake" />
+
+Transitions a model from sleeping to serving.
+
+```json
+{"model": "llama-3-8b"}
+```
+
+**Response:**
+
+```json
+{
+  "status": "success",
+  "old_state": "sleeping",
+  "new_state": "serving",
+  "duration_ms": 1800,
+  "timed_out": false
+}
+```
+
+### Sleep a model
+
+<ApiEndpoint method="POST" path="/api/sleep" />
+
+Transitions a model from serving to sleeping. In-flight requests are drained before the model sleeps.
+
+```json
+{"model": "llama-3-8b"}
+```
+
+### System metrics
+
+<ApiEndpoint method="GET" path="/api/metrics/system" />
+
+Returns GPU utilization and model placement information.
+
+```json
+{
+  "timestamp": "2025-11-25T12:00:00Z",
+  "gpus": [
+    {
+      "index": 0,
+      "name": "NVIDIA A100-SXM4-80GB",
+      "total_memory_mib": 81920,
+      "used_memory_mib": 45000,
+      "free_memory_mib": 36920,
+      "utilization_percent": 65,
+      "temperature_celsius": 72
+    }
+  ],
+  "models": [
+    {
+      "backend_name": "llama-3-8b",
+      "model_name": "meta-llama/Meta-Llama-3-8B-Instruct",
+      "status": "serving",
+      "gpu_index": 0,
+      "gpu_memory_used_mib": 16384,
+      "last_accessed": "2025-11-25T11:59:30Z"
+    }
+  ]
+}
+```
+
+### Agent info
+
+<ApiEndpoint method="GET" path="/agent/info" />
+
+Returns agent metadata and connected model list.
+
+```json
+{
+  "site_id": "tenant_00000001",
+  "org_id": "org_00000001",
+  "node_id": "agent_00000001",
+  "nats_connected": true,
+  "started_at": "2025-11-25T08:00:00Z",
+  "uptime_seconds": 14400.5,
+  "models_loaded": 3,
+  "models": ["llama-3-8b", "mistral-7b", "qwen-14b"]
+}
+```

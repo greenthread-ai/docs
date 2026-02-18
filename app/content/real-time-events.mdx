@@ -1,0 +1,142 @@
+import { ApiEndpoint } from '../components/api-endpoint'
+import { Callout } from '../components/callout'
+
+GreenThread provides a Server-Sent Events (SSE) endpoint for real-time notifications about model state changes, request activity, and container lifecycle events.
+
+## Connecting
+
+<ApiEndpoint method="GET" path="/api/events" />
+
+Open an SSE connection to receive events:
+
+```javascript
+const eventSource = new EventSource("/api/events");
+
+eventSource.onmessage = (event) => {
+  const data = JSON.parse(event.data);
+  console.log(`${data.type}: ${data.model_name} — ${data.message}`);
+};
+
+eventSource.onerror = () => {
+  // Implement reconnection logic
+  setTimeout(() => {
+    // Reconnect
+  }, 5000);
+};
+```
+
+## Event format
+
+All events share this structure:
+
+```json
+{
+  "id": "20251125120000001",
+  "type": "wake_completed",
+  "timestamp": 1732532400000,
+  "model_name": "llama-3-8b",
+  "message": "Wake completed successfully",
+  "duration_ms": 1800,
+  "metadata": {
+    "old_status": "sleeping",
+    "new_status": "serving",
+    "gpu_memory_used": 17179869184
+  }
+}
+```
+
+## Event types
+
+### System events
+
+| Type | Description | When |
+|------|-------------|------|
+| `system_state` | Full system snapshot | On connect + periodically |
+
+The `system_state` event includes all models with their status and all GPUs with memory usage. Use this to initialize your UI state on connection.
+
+### Wake/sleep events
+
+| Type | Description | When |
+|------|-------------|------|
+| `wake_started` | Wake operation initiated | Model begins waking |
+| `wake_completed` | Model transitioned to serving | Wake finished successfully |
+| `wake_failed` | Wake operation failed | Wake error occurred |
+| `sleep_started` | Sleep operation initiated | Model begins sleeping |
+| `sleep_completed` | Model transitioned to sleeping | Sleep finished |
+| `sleep_failed` | Sleep operation failed | Sleep error occurred |
+
+### Request events
+
+| Type | Description | When |
+|------|-------------|------|
+| `request_received` | Inference request arrived | Request queued |
+| `request_completed` | Request processed successfully | Response sent |
+| `request_failed` | Request failed | Error occurred |
+
+### Container events
+
+| Type | Description | When |
+|------|-------------|------|
+| `container_started` | Backend container started | Process launched |
+| `container_stopped` | Backend container stopped | Process terminated |
+| `container_error` | Container error occurred | Process crashed or OOM |
+
+## Example: system state event
+
+```json
+{
+  "id": "20251125120000001",
+  "type": "system_state",
+  "timestamp": 1732532400000,
+  "model_name": "",
+  "message": "System state update",
+  "metadata": {
+    "models": [
+      {
+        "backend_name": "llama-3-8b",
+        "status": "serving",
+        "gpu_memory_used": 17179869184
+      }
+    ],
+    "gpus": [
+      {
+        "index": 0,
+        "total_memory": 85899345920,
+        "used_memory": 17599299584,
+        "utilization": 45
+      }
+    ]
+  }
+}
+```
+
+## Python client
+
+```python
+import json
+import requests
+import sseclient
+
+def subscribe(base_url):
+    response = requests.get(f"{base_url}/api/events", stream=True)
+    client = sseclient.SSEClient(response)
+
+    for event in client.events():
+        data = json.loads(event.data)
+        yield data
+
+for event in subscribe("http://localhost:8080"):
+    print(f"{event['type']}: {event.get('model_name', 'system')}")
+```
+
+## Best practices
+
+- Use SSE for real-time dashboards that need immediate state updates.
+- Use the REST API (`GET /v1/models`) for periodic status checks or when SSE isn't supported.
+- Implement reconnection logic with exponential backoff — SSE connections can drop.
+- Use the `system_state` event on reconnect to sync your local state.
+
+<Callout type="tip" title="Polling fallback">
+If SSE is not an option, poll `GET /v1/models` every 5-10 seconds for model status updates.
+</Callout>

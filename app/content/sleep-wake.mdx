@@ -1,0 +1,101 @@
+import { Callout } from '../components/callout'
+
+Sleep and wake is the core mechanism that lets GreenThread serve many models from limited GPU memory. When a model isn't being used, it's put to sleep — freeing GPU VRAM while keeping the process alive. When a request arrives, it's woken in under 2 seconds.
+
+## How sleep works
+
+When a model is put to sleep:
+
+1. In-flight requests are drained (the model transitions to `deactivating` first).
+2. Model weights are released from GPU memory.
+3. The KV cache is cleared.
+
+What **survives** sleep: the inference process, GPU context, engine state, and tokenizer. This is why wake is so fast — there's no cold start overhead.
+
+Sleep typically completes in **~90 milliseconds** because it's just dropping references, not moving data.
+
+## How wake works
+
+When a sleeping model needs to serve a request:
+
+1. GPU memory is allocated for the model weights.
+2. The storage server transfers weights from CPU cache to GPU (~1.5s for a 20B model).
+3. Model tensors are reconstructed from the GPU buffer.
+4. The KV cache is reallocated.
+
+Total wake time for a 20B model from system RAM: **~1.8 seconds**.
+
+## Storage tiers and wake time
+
+Wake time depends on where the model weights are stored:
+
+| Storage Tier | Wake Time (20B model) | Description |
+|-------------|----------------------|-------------|
+| System RAM (pinned) | ~1.8 seconds | Weights held in CPU memory, transferred directly to GPU |
+| Disk | ~30-40 seconds | Weights loaded from disk, then transferred to GPU |
+
+Models staged in system RAM wake dramatically faster. Use the `staging_tier` field when adding a model to control this:
+
+```json
+{
+  "backend_name": "my-model",
+  "model_name": "meta-llama/Llama-3.1-70B-Instruct",
+  "staging_tier": "system",
+  "staging_pinned": true
+}
+```
+
+See [Storage & Pinning](/storage-pinning) for details on tier management.
+
+## Auto-wake on request
+
+When an inference request arrives for a sleeping model, GreenThread automatically:
+
+1. Queues the request.
+2. Initiates wake (if not already waking).
+3. Processes the queued request once the model is serving.
+
+No client-side retry logic is needed — the request blocks until the model is ready, then completes normally.
+
+<Callout type="info" title="Wake deduplication">
+If multiple requests arrive while a model is waking, only one wake operation runs. All requests are queued and served in order once the model is ready.
+</Callout>
+
+## Drain behavior
+
+Before sleep, GreenThread drains in-flight requests:
+
+1. The `PreemptionRequested` flag is set, stopping new request acceptance.
+2. The system waits for `InFlightCount` to reach zero (up to `fairness_drain_timeout`, default 30s).
+3. Once drained, the sleep command is sent to the backend.
+
+This ensures no requests are dropped during model transitions.
+
+## Manual wake/sleep
+
+You can explicitly control model state through the API:
+
+```bash
+# Wake a model
+curl -X POST https://your-host:8080/api/wake \
+  -H "Content-Type: application/json" \
+  -d '{"model": "llama-3-8b"}'
+
+# Sleep a model
+curl -X POST https://your-host:8080/api/sleep \
+  -H "Content-Type: application/json" \
+  -d '{"model": "llama-3-8b"}'
+```
+
+## Why it's fast
+
+Traditional model loading involves runtime startup, weight deserialization, and GPU copies — taking 35-45 seconds for a 20B model.
+
+GreenThread eliminates all of that:
+
+- The inference runtime is **already running** (it survives sleep)
+- Model weights are **already in CPU cache**
+- GPU transfer is **optimized for throughput** (~25 GB/s)
+- Tensor reconstruction is **batched** for minimal overhead
+
+The result is a **~22x speedup** over cold start.
