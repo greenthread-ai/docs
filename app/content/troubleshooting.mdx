@@ -53,7 +53,7 @@ If a model enters the `error` state after adding it:
 
 ```bash
 # Check model-specific logs
-curl http://localhost:8080/api/models/your-model-name/health
+curl http://localhost:8000/api/models/your-model-name/health
 
 # View engine logs for the model
 journalctl -u gthread-engine | grep "your-model-name"
@@ -80,7 +80,7 @@ If models take longer than expected to wake:
 To ensure fast wake times, pin critical models in system RAM:
 
 ```bash
-curl -X POST http://localhost:8080/api/models/your-model/staging \
+curl -X POST http://localhost:8000/api/models/your-model/staging \
   -H "Content-Type: application/json" \
   -d '{"tier": "system", "pin": true}'
 ```
@@ -88,7 +88,7 @@ curl -X POST http://localhost:8080/api/models/your-model/staging \
 ## Health endpoint returns unhealthy
 
 ```bash
-curl http://localhost:8080/health | python3 -m json.tool
+curl http://localhost:8000/health | python3 -m json.tool
 ```
 
 Check the `components` object to identify which component is failing:
@@ -118,10 +118,10 @@ The last 2 versions are kept in `/opt/gthread/versions/`. To roll back, stop ser
 
 ## Port conflicts
 
-GreenThread listens on port 8080 by default. If another process is using this port:
+GreenThread listens on port 8000 by default. If another process is using this port:
 
 ```bash
-sudo ss -tlnp | grep 8080
+sudo ss -tlnp | grep 8000
 ```
 
 ## Getting help
@@ -141,5 +141,5 @@ journalctl -u gthread-engine --no-pager -n 100 > engine.log
 journalctl -u gthread-storage --no-pager -n 100 > storage.log
 
 # Health
-curl http://localhost:8080/health
+curl http://localhost:8000/health
 ```

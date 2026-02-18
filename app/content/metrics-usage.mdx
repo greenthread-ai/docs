@@ -31,7 +31,7 @@ Configure your Prometheus instance to scrape this endpoint:
 scrape_configs:
   - job_name: greenthread
     static_configs:
-      - targets: ["your-host:8080"]
+      - targets: ["your-host:8000"]
     scrape_interval: 15s
 ```
 
@@ -62,7 +62,7 @@ Returns token-level usage data for billing. Supports filtering by time range, AP
 **Example:**
 
 ```bash
-curl "https://your-host:8080/api/metrics/usage?start=2025-01-01T00:00:00Z&end=2025-01-02T00:00:00Z&granularity=hourly"
+curl "https://your-host:8000/api/metrics/usage?start=2025-01-01T00:00:00Z&end=2025-01-02T00:00:00Z&granularity=hourly"
 ```
 
 ### GPU history

@@ -77,12 +77,12 @@ You can explicitly control model state through the API:
 
 ```bash
 # Wake a model
-curl -X POST https://your-host:8080/api/wake \
+curl -X POST https://your-host:8000/api/wake \
   -H "Content-Type: application/json" \
   -d '{"model": "llama-3-8b"}'
 
 # Sleep a model
-curl -X POST https://your-host:8080/api/sleep \
+curl -X POST https://your-host:8000/api/sleep \
   -H "Content-Type: application/json" \
   -d '{"model": "llama-3-8b"}'
 ```

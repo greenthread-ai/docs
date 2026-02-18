@@ -126,7 +126,7 @@ def subscribe(base_url):
         data = json.loads(event.data)
         yield data
 
-for event in subscribe("http://localhost:8080"):
+for event in subscribe("http://localhost:8000"):
     print(f"{event['type']}: {event.get('model_name', 'system')}")
 ```
 

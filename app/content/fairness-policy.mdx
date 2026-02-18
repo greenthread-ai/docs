@@ -36,7 +36,7 @@ If a popular model is preempted (e.g., by explicit API sleep), GreenThread track
 Mark a model as popular:
 
 ```bash
-curl -X POST https://your-host:8080/api/models/set_popular \
+curl -X POST https://your-host:8000/api/models/set_popular \
   -H "Content-Type: application/json" \
   -d '{"backend_name": "llama-3-8b", "popular": true}'
 ```
