@@ -10,7 +10,7 @@ LoRA adapter loading uses a cache-on-demand pattern:
 
 1. You send an inference request with `lora_adapter_metadata` specifying the adapter.
 2. If the adapter is **not cached** on the node, the API returns a `404`.
-3. Your proxy catches the 404, generates signed URLs for the adapter files, and retries with the `files` array.
+3. Your proxy catches the 404, generates signed URLs for the adapter files, and retries with the `files` dict.
 4. GreenThread downloads the adapter, caches it, and serves the request.
 5. Subsequent requests for the same adapter and `hash` are served from cache instantly.
 
@@ -47,7 +47,10 @@ Add the `lora_adapter_metadata` field alongside your normal request body on the 
       "id": "string (required)",
       "name": "string (required)",
       "hash": "string (recommended)",
-      "files": ["string (optional)"]
+      "files": {
+        "adapter_config.json": "https://...",
+        "adapter_model.safetensors": "https://..."
+      }
     }
   }
 }
@@ -58,7 +61,7 @@ Add the `lora_adapter_metadata` field alongside your normal request body on the 
 | `id` | string | Yes | Unique identifier, used as the cache key |
 | `name` | string | Yes | Display name, returned as the `model` field in responses |
 | `hash` | string | Recommended | Version identifier for cache invalidation |
-| `files` | string[] | Conditional | URLs to adapter files. Required on retry after a 404 |
+| `files` | object or string[] | Conditional | Adapter files to download. Required on retry after a 404. Preferred format is a dict mapping filename to URL. A flat list of URLs is also accepted (filenames are inferred from URL paths). |
 
 ## Integration pattern
 
@@ -82,9 +85,10 @@ def inference_with_lora(prompt, adapter):
 
     if response.status_code == 404:
         # Adapter not cached — add signed file URLs and retry
-        payload["lora_adapter_metadata"]["lora_model"]["files"] = [
-            generate_signed_url(f) for f in adapter.file_keys
-        ]
+        payload["lora_adapter_metadata"]["lora_model"]["files"] = {
+            filename: generate_signed_url(key)
+            for filename, key in adapter.file_keys.items()
+        }
         response = requests.post(GREENTHREAD_URL, json=payload)
 
     return response.json()
