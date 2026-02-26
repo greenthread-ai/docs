@@ -106,6 +106,16 @@ export const sections: DocSection[] = [
     ],
   },
   {
+    title: "Tools",
+    pages: [
+      {
+        slug: "cost-calculator",
+        title: "Cost Calculator",
+        description: "Compare GreenThread vs Bedrock monthly costs",
+      },
+    ],
+  },
+  {
     title: "Deployment",
     pages: [
       {

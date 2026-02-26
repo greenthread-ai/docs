@@ -15,6 +15,7 @@ const slugs = [
   "metrics-usage",
   "real-time-events",
   "model-configuration",
+  "cost-calculator",
   "requirements",
   "prerequisites",
   "install",
