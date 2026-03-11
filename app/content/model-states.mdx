@@ -72,7 +72,7 @@ Once a model reaches the `Ready` phase, its pod runs a sidecar proxy that manage
 
 | State | Description | VRAM Usage |
 |-------|-------------|------------|
-| `sleeping` | vLLM process running but CUDA checkpoint active | **0 bytes** |
+| `sleeping` | Process running, GPU memory fully released | **0 bytes** |
 | `pending` | Sleeping, waiting for GPU memory (preemption may be needed) | 0 bytes |
 | `waking` | Acquiring GPU memory and reloading weights | Growing |
 | `serving` | Actively handling inference requests | Full allocation |
@@ -85,13 +85,13 @@ stateDiagram-v2
     pending --> waking: GPU memory available
     waking --> serving: weights loaded
     serving --> deactivating: idle timeout or preemption
-    deactivating --> sleeping: requests drained, CUDA checkpoint
+    deactivating --> sleeping: requests drained, GPU released
     serving --> sleeping: sleep (no in-flight requests)
     pending --> waking: preemption frees memory
 `} />
 
 <Callout type="info" title="True zero VRAM">
-When sleeping, GreenThread calls vLLM's `/sleep?level=2` endpoint which performs a full CUDA checkpoint. This releases **all** GPU memory — not just most of it. Sleeping models consume exactly 0 bytes of VRAM, making the GPU fully available for other models.
+When sleeping, GreenThread releases **all** GPU memory — not just most of it. Sleeping models consume exactly 0 bytes of VRAM, making the GPU fully available for other models.
 </Callout>
 
 ### Check sidecar state
@@ -131,7 +131,7 @@ When a model transitions from serving to sleeping (either voluntary idle timeout
 1. **State → `deactivating`** — the sidecar activates the preemption barrier
 2. **Barrier stops new requests** — `TryClaimRequest()` returns `false`, new requests get `503`
 3. **Drain in-flight requests** — waits up to `drainTimeout` for active requests to complete
-4. **CUDA checkpoint** — calls vLLM `/sleep?level=2` to checkpoint GPU state
+4. **Release GPU** — GreenThread releases all GPU memory (true zero VRAM)
 5. **Release memory** — updates GPU CRD occupant from `serving` → `sleeping` with `reservedMemoryBytes: 0`
 6. **State → `sleeping`** — model is fully asleep, GPU memory is free
 

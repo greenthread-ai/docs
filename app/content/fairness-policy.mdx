@@ -24,7 +24,7 @@ sequenceDiagram
     S->>S: Select LRU non-popular victim
     S->>G: Signal victim via PreemptionIntent
     V->>G: Detect preemption intent
-    V->>V: Drain requests + CUDA checkpoint
+    V->>V: Drain requests + release GPU
     V->>G: Release memory (occupant → sleeping)
     S->>G: Claim memory + acquire wake lock
     S->>S: Load weights + wake vLLM
@@ -106,7 +106,7 @@ The preemption barrier ensures graceful request handling during model eviction:
 
 1. **Barrier activates** — the victim sidecar stops accepting new requests (`503` response).
 2. **Drain in-flight** — waits up to `sleep.drainTimeout` for active requests to complete.
-3. **CUDA checkpoint** — once drained, the model checkpoints and releases all VRAM.
+3. **Release GPU** — once drained, the model releases all VRAM.
 4. **Barrier deactivates** — cleanup after sleep completes.
 
 If the drain timeout expires with requests still in-flight, the sleep proceeds anyway to prevent starvation of the waiting model.

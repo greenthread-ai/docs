@@ -16,7 +16,7 @@ Each model pod's sidecar exposes the following Prometheus metrics:
 |--------|------|--------|-------------|
 | `gthread_sidecar_state` | Gauge | `state` | Current sidecar state. Exactly one label value is `1` at any time: `sleeping`, `pending`, `waking`, `serving`, `deactivating`. |
 | `gthread_sidecar_wake_duration_seconds` | Histogram | — | Time to wake a model from sleeping to serving |
-| `gthread_sidecar_sleep_duration_seconds` | Histogram | — | Time to sleep a model (drain + CUDA checkpoint) |
+| `gthread_sidecar_sleep_duration_seconds` | Histogram | — | Time to sleep a model (drain + GPU release) |
 
 ### Request handling
 

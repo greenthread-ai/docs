@@ -162,7 +162,7 @@ sleep:
 | `idleTimeout` | duration | `5m` | Duration with no requests before the model voluntarily sleeps |
 | `drainTimeout` | duration | `30s` | Maximum time to wait for in-flight requests to complete during sleep |
 
-When a model sleeps, it performs a CUDA checkpoint (`/sleep?level=2`) that releases **all** VRAM, making the GPU available for other models.
+When a model sleeps, GreenThread releases **all** VRAM, making the GPU available for other models.
 
 ## Fairness spec
 

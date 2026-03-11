@@ -137,7 +137,7 @@ Each model Pod exposes the following endpoints through its sidecar. In productio
 | `/health` | GET | Liveness probe. Returns `503` during boot, `200` once ready. |
 | `/ready` | GET | Readiness probe. Returns `200` only when the model is actively serving. |
 | `/status` | GET | Model status JSON: state, boot readiness, queue depth, barrier status. |
-| `/v1/models` | GET | Proxied to vLLM. Lists loaded models (works even when sleeping). |
+| `/v1/models` | GET | Lists loaded models (works even when sleeping). |
 
 ### Inference (OpenAI-compatible)
 

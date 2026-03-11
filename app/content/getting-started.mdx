@@ -50,7 +50,7 @@ flowchart LR
     SA -.->|wake| G1
 `} />
 
-Each model runs in its own pod with a sidecar that handles request queuing, wake-on-request, and sleep lifecycle. When a model sleeps, it performs a CUDA checkpoint that releases **all** GPU memory — true zero VRAM — making the GPU fully available for other models.
+Each model runs in its own pod with a sidecar that handles request queuing, wake-on-request, and sleep lifecycle. When a model sleeps, GreenThread releases **all** GPU memory — true zero VRAM — making the GPU fully available for other models.
 
 ## Performance
 
@@ -63,7 +63,7 @@ For a 20B-parameter model:
 | GreenThread wake (from NVMe with GDS) | ~2 seconds |
 | GreenThread sleep | ~90 milliseconds |
 
-The improvement comes from keeping the vLLM process alive while sleeping and using fast transfer paths — DMA from pinned host memory at ~65 GB/s, or GPU Direct Storage from NVMe at ~20 GB/s.
+The improvement comes from keeping the inference process alive while sleeping and using fast transfer paths — DMA from pinned host memory at ~65 GB/s, or GPU Direct Storage from NVMe at ~20 GB/s.
 
 ## API compatibility
 
