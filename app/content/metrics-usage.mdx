@@ -1,113 +1,177 @@
-import { ApiEndpoint } from '../components/api-endpoint'
 import { Callout } from '../components/callout'
 
-GreenThread exposes metrics through both a Prometheus-compatible endpoint and JSON APIs for usage tracking and billing.
+GreenThread exposes Prometheus metrics from every model pod's sidecar. When monitoring is enabled, these metrics are automatically scraped by the kube-prometheus-stack and visualized in pre-built Grafana dashboards.
 
-## Prometheus metrics
+<Callout type="info" title="Full monitoring setup">
+For installation of the kube-prometheus-stack, Grafana access, and alerting configuration, see [Monitoring](/k8s-monitoring).
+</Callout>
 
-<ApiEndpoint method="GET" path="/metrics" />
+## Sidecar metrics
 
-Standard Prometheus scrape endpoint. Returns all metric families in Prometheus exposition format.
+Each model pod's sidecar exposes the following Prometheus metrics:
 
-Key metrics include:
+### State and lifecycle
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `gthread_sidecar_state` | Gauge | `state` | Current sidecar state. Exactly one label value is `1` at any time: `sleeping`, `pending`, `waking`, `serving`, `deactivating`. |
+| `gthread_sidecar_wake_duration_seconds` | Histogram | — | Time to wake a model from sleeping to serving |
+| `gthread_sidecar_sleep_duration_seconds` | Histogram | — | Time to sleep a model (drain + GPU release) |
+
+### Request handling
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `gthread_sidecar_requests_total` | Counter | `status` | Total requests processed. Labels: `success`, `error`. |
+| `gthread_sidecar_queue_depth` | Gauge | — | Current request queue depth |
+| `gthread_sidecar_in_flight_requests` | Gauge | — | Number of requests currently being processed |
+
+### GPU memory
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `gthread_sidecar_gpu_memory_reserved_bytes` | Gauge | `gpu` | Reserved GPU memory in bytes per GPU index |
+| `gthread_sidecar_gpu_memory_serving_bytes` | Gauge | `gpu` | Measured serving GPU memory in bytes per GPU index |
+
+### Preemption and scheduling
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `gthread_sidecar_preemptions_total` | Counter | `role` | Preemption events. Labels: `preempted` (this model was evicted), `preemptor` (this model evicted another). |
+| `gthread_sidecar_preemption_barrier_timeouts_total` | Counter | — | Drain timeouts during preemption barrier |
+| `gthread_sidecar_wake_deduplications_total` | Counter | — | Times a wake request was coalesced with an in-flight wake |
+| `gthread_sidecar_gpu_cas_conflicts_total` | Counter | — | Optimistic CAS conflicts on GPU CRD updates |
+
+## Scrape configuration
+
+When `monitoring.enabled=true` in the Helm chart, GreenThread automatically deploys:
+
+| Resource | Type | Description |
+|----------|------|-------------|
+| `greenthread-sidecar` | PodMonitor | Scrapes sidecar metrics from every model pod |
+| `greenthread-controller` | ServiceMonitor | Scrapes controller metrics |
+| `greenthread-apiserver` | ServiceMonitor | Scrapes API server metrics |
+| `greenthread-dcgm` | PodMonitor | Scrapes DCGM GPU metrics |
+| `greenthread-vllm` | PodMonitor | Scrapes vLLM inference engine metrics |
+
+No manual Prometheus configuration is needed — the monitors are picked up automatically by the kube-prometheus-stack.
+
+<Callout type="warning" title="Cross-namespace scraping">
+The kube-prometheus-stack must be installed with `serviceMonitorSelectorNilUsesHelmValues=false` and `podMonitorSelectorNilUsesHelmValues=false` to scrape monitors from the `greenthread-system` namespace. See [Monitoring](/k8s-monitoring) for installation details.
+</Callout>
+
+## Grafana dashboards
+
+GreenThread deploys four dashboards as ConfigMaps that are automatically provisioned into Grafana:
+
+| Dashboard | Description |
+|-----------|-------------|
+| GreenThread GPU Dashboard | GPU utilization, memory, temperature across all nodes |
+| GreenThread Models Dashboard | Model lifecycle, wake/sleep times, request rates per model |
+| GreenThread System Dashboard | Controller reconciliation, queue depth, errors |
+| GreenThread vLLM Dashboard | vLLM inference latency, throughput, KV cache utilization |
+
+Dashboards appear under the **GreenThread** folder in Grafana.
+
+## Example queries
+
+### Wake latency (p99)
+
+```promql
+histogram_quantile(0.99, rate(gthread_sidecar_wake_duration_seconds_bucket[5m]))
+```
+
+### Request rate per model
+
+```promql
+sum by (pod) (rate(gthread_sidecar_requests_total{status="success"}[5m]))
+```
+
+### Models currently serving
+
+```promql
+count(gthread_sidecar_state{state="serving"} == 1)
+```
+
+### Queue depth across all models
+
+```promql
+sum(gthread_sidecar_queue_depth)
+```
+
+### Preemption rate
+
+```promql
+sum(rate(gthread_sidecar_preemptions_total[5m])) by (role)
+```
+
+### GPU memory utilization per model
+
+```promql
+gthread_sidecar_gpu_memory_serving_bytes
+```
+
+### Sleep/wake frequency
+
+```promql
+# Wakes per minute
+sum(rate(gthread_sidecar_wake_duration_seconds_count[5m])) * 60
+
+# Sleeps per minute
+sum(rate(gthread_sidecar_sleep_duration_seconds_count[5m])) * 60
+```
+
+## vLLM metrics
+
+In addition to sidecar metrics, the vLLM inference engine exposes its own metrics (scraped by the `greenthread-vllm` PodMonitor). Key vLLM metrics include:
 
 | Metric | Type | Description |
 |--------|------|-------------|
-| `gthread_model_status` | Gauge | Current model state (labeled by backend_name) |
-| `gthread_gpu_memory_used_bytes` | Gauge | GPU memory usage per device |
-| `gthread_gpu_memory_total_bytes` | Gauge | Total GPU memory per device |
-| `gthread_gpu_utilization_percent` | Gauge | GPU compute utilization |
-| `gthread_gpu_temperature_celsius` | Gauge | GPU temperature |
-| `gthread_inference_requests_total` | Counter | Total inference requests (labeled by model, status) |
-| `gthread_inference_duration_seconds` | Histogram | Request duration distribution |
-| `gthread_wake_duration_seconds` | Histogram | Model wake time distribution |
-| `gthread_sleep_duration_seconds` | Histogram | Model sleep time distribution |
-| `gthread_tokens_total` | Counter | Total tokens processed (prompt + completion) |
-| `gthread_queue_depth` | Gauge | Current request queue depth per model |
+| `vllm:request_success_total` | Counter | Successful inference requests |
+| `vllm:request_duration_seconds` | Histogram | End-to-end request duration |
+| `vllm:time_to_first_token_seconds` | Histogram | Time to first token (TTFT) |
+| `vllm:time_per_output_token_seconds` | Histogram | Inter-token latency |
+| `vllm:num_requests_running` | Gauge | Currently running requests |
+| `vllm:num_requests_waiting` | Gauge | Requests waiting in queue |
+| `vllm:gpu_cache_usage_perc` | Gauge | KV cache utilization percentage |
+| `vllm:prompt_tokens_total` | Counter | Total prompt tokens processed |
+| `vllm:generation_tokens_total` | Counter | Total completion tokens generated |
 
-Configure your Prometheus instance to scrape this endpoint:
+## DCGM metrics
 
-```yaml
-scrape_configs:
-  - job_name: greenthread
-    static_configs:
-      - targets: ["your-host:8000"]
-    scrape_interval: 15s
-```
+GPU hardware metrics are exposed via DCGM (Data Center GPU Manager), scraped by the `greenthread-dcgm` PodMonitor:
 
-## JSON metrics APIs
+| Metric | Description |
+|--------|-------------|
+| `DCGM_FI_DEV_GPU_UTIL` | GPU compute utilization (%) |
+| `DCGM_FI_DEV_MEM_COPY_UTIL` | Memory copy utilization (%) |
+| `DCGM_FI_DEV_FB_USED` | Framebuffer memory used (MB) |
+| `DCGM_FI_DEV_FB_FREE` | Framebuffer memory free (MB) |
+| `DCGM_FI_DEV_GPU_TEMP` | GPU temperature (C) |
+| `DCGM_FI_DEV_POWER_USAGE` | Power draw (W) |
 
-### System metrics
+## GPU CRD as live state
 
-<ApiEndpoint method="GET" path="/api/metrics/system" />
-
-Returns a snapshot of GPU and model metrics. See [Model States](/model-states#system-metrics) for the full response schema.
-
-### Usage metrics
-
-<ApiEndpoint method="GET" path="/api/metrics/usage" />
-
-Returns token-level usage data for billing. Supports filtering by time range, API key, and model.
-
-**Query parameters:**
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `start` | ISO 8601 | Start of time range |
-| `end` | ISO 8601 | End of time range |
-| `api_key` | string | Filter by API key ID |
-| `model` | string | Filter by model name |
-| `granularity` | string | `"raw"`, `"hourly"`, or `"daily"` |
-
-**Example:**
+Beyond Prometheus metrics, the GPU custom resources provide a live view of the scheduling state:
 
 ```bash
-curl "https://your-host:8000/api/metrics/usage?start=2025-01-01T00:00:00Z&end=2025-01-02T00:00:00Z&granularity=hourly"
+kubectl get gpu -A
 ```
 
-### GPU history
+Each GPU CRD's status includes:
 
-<ApiEndpoint method="GET" path="/api/metrics/gpu/history" />
+| Field | Description |
+|-------|-------------|
+| `stats.usedMemoryBytes` | Actual measured GPU memory in use (NVML) |
+| `stats.freeMemoryBytes` | Free GPU memory (NVML) |
+| `stats.utilizationPercent` | GPU compute utilization |
+| `stats.temperatureCelsius` | GPU temperature |
+| `stats.powerWatts` | Current power draw |
+| `occupants` | List of models loaded on this GPU with their state and reserved memory |
 
-Returns historical GPU metrics over time — useful for dashboards and trend analysis.
+This provides real-time scheduling visibility without needing Prometheus:
 
-### Models with usage
-
-<ApiEndpoint method="GET" path="/api/metrics/models" />
-
-Returns the list of model names that have recorded usage data. Useful for populating filter dropdowns in dashboards.
-
-### Swap metrics
-
-<ApiEndpoint method="GET" path="/api/metrics/swap" />
-
-Returns sleep/wake operation metrics — counts, durations, and failure rates.
-
-## Usage tracking
-
-Every inference request is tracked with:
-
-- **API key ID** — Which key made the request
-- **Model name** — Which model was used
-- **Token counts** — Prompt tokens, completion tokens, total tokens
-- **Timestamp** — When the request was processed
-- **Duration** — How long the request took
-
-Records are stored in an embedded key-value store with time-indexed keys for efficient range queries.
-
-## Aggregation
-
-Usage data is automatically aggregated at two levels:
-
-- **Hourly** — Token counts and request counts per hour, per API key, per model
-- **Daily** — Same metrics rolled up by day
-
-Use the `granularity` parameter on the usage API to select the aggregation level. Raw records provide the most detail but are larger.
-
-## Retention
-
-Usage records follow a configurable retention policy. Old records are automatically deleted based on the `retention_days` setting (default: 7 days for batch results, configurable for usage data).
-
-<Callout type="tip" title="Export for billing">
-For production billing, scrape the usage API periodically and store results in your own data warehouse. The hourly granularity provides a good balance between detail and volume.
-</Callout>
+```bash
+# Quick overview of GPU occupants
+kubectl get gpu -A -o jsonpath='{range .items[*]}{.metadata.name}: {range .status.occupants[*]}{.modelName}({.state}) {end}{"\n"}{end}'
+```

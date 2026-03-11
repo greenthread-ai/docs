@@ -1,27 +1,44 @@
 import { ApiEndpoint } from '../components/api-endpoint'
 import { Callout } from '../components/callout'
 
-GreenThread exposes OpenAI-compatible inference endpoints. Any client library or tool that works with OpenAI's API works with GreenThread without modification.
+GreenThread exposes inference endpoints through a per-model sidecar proxy. Each model gets its own URL path through the Kubernetes Gateway, and the sidecar handles wake-on-request, request queuing, and proxying to the vLLM inference engine.
+
+## Endpoint routing
+
+Each model is accessible at its own path prefix through the gateway:
+
+```
+http://<gateway-address>/<model-name>/v1/chat/completions
+```
+
+The `<model-name>` is the Kubernetes Model CRD name (e.g. `llama-3-8b`), not the HuggingFace model ID. The gateway strips the model name prefix before forwarding to the sidecar.
+
+Get your gateway address:
+
+```bash
+GATEWAY_URL=$(kubectl get gateway -n greenthread-system greenthread-gateway \
+  -o jsonpath='{.status.addresses[0].value}')
+```
 
 ## Chat completions
 
-<ApiEndpoint method="POST" path="/v1/chat/completions" />
+<ApiEndpoint method="POST" path="/<model>/v1/chat/completions" />
 
 Generate a chat completion. Supports multi-turn conversations and streaming.
 
-**Request:**
-
-```json
-{
-  "model": "meta-llama/Llama-3.1-8B-Instruct",
-  "messages": [
-    {"role": "system", "content": "You are a helpful assistant."},
-    {"role": "user", "content": "What is GreenThread?"}
-  ],
-  "temperature": 0.7,
-  "max_tokens": 512,
-  "stream": false
-}
+```bash
+curl http://$GATEWAY_URL/llama-3-8b/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "meta-llama/Llama-3.1-8B-Instruct",
+    "messages": [
+      {"role": "system", "content": "You are a helpful assistant."},
+      {"role": "user", "content": "What is GreenThread?"}
+    ],
+    "temperature": 0.7,
+    "max_tokens": 512,
+    "stream": false
+  }'
 ```
 
 **Response:**
@@ -50,13 +67,15 @@ Generate a chat completion. Supports multi-turn conversations and streaming.
 }
 ```
 
+<Callout type="tip" title="Model field">
+The `model` field in the request body uses the full HuggingFace model ID (e.g. `meta-llama/Llama-3.1-8B-Instruct`). The URL path uses the Model CRD name (e.g. `llama-3-8b`).
+</Callout>
+
 ## Text completions
 
-<ApiEndpoint method="POST" path="/v1/completions" />
+<ApiEndpoint method="POST" path="/<model>/v1/completions" />
 
 Generate a text completion from a prompt string.
-
-**Request:**
 
 ```json
 {
@@ -67,13 +86,97 @@ Generate a text completion from a prompt string.
 }
 ```
 
+## Responses API
+
+<ApiEndpoint method="POST" path="/<model>/v1/responses" />
+
+OpenAI Responses API. Supports tool use, multi-turn agents, and structured outputs.
+
+## Messages API (Anthropic-compatible)
+
+<ApiEndpoint method="POST" path="/<model>/v1/messages" />
+
+Anthropic Messages API format. Use this with models that support the Anthropic API schema.
+
+### Token counting
+
+<ApiEndpoint method="POST" path="/<model>/v1/messages/count_tokens" />
+
+Count tokens for a messages request without running inference.
+
+## Embeddings
+
+<ApiEndpoint method="POST" path="/<model>/v1/embeddings" />
+
+Generate text embeddings. Requires a model that supports embeddings (e.g. sentence-transformers).
+
+```json
+{
+  "model": "sentence-transformers/all-MiniLM-L6-v2",
+  "input": "The quick brown fox jumps over the lazy dog"
+}
+```
+
+## Audio
+
+### Transcriptions
+
+<ApiEndpoint method="POST" path="/<model>/v1/audio/transcriptions" />
+
+Transcribe audio to text. Requires a Whisper-compatible model.
+
+### Translations
+
+<ApiEndpoint method="POST" path="/<model>/v1/audio/translations" />
+
+Translate audio to English text.
+
+## Scoring and reranking
+
+### Scoring
+
+<ApiEndpoint method="POST" path="/<model>/v1/score" />
+
+Score text pairs. Also available at the root-level alias `/score`.
+
+### Reranking
+
+<ApiEndpoint method="POST" path="/<model>/v1/rerank" />
+
+Rerank documents by relevance. Also available as `/v2/rerank` and root-level aliases `/rerank`.
+
+## Tokenization
+
+### Tokenize
+
+<ApiEndpoint method="POST" path="/<model>/tokenize" />
+
+Tokenize text into token IDs.
+
+### Detokenize
+
+<ApiEndpoint method="POST" path="/<model>/detokenize" />
+
+Convert token IDs back to text.
+
+## Classification
+
+<ApiEndpoint method="POST" path="/<model>/classify" />
+
+Text classification.
+
+## SageMaker compatibility
+
+<ApiEndpoint method="POST" path="/<model>/invocations" />
+
+SageMaker-compatible inference endpoint.
+
 ## Streaming
 
 Set `"stream": true` to receive Server-Sent Events as the model generates tokens:
 
 ```bash
-curl https://your-host:8000/v1/chat/completions \
-  -H "Authorization: Bearer gthread_xxx" \
+curl http://$GATEWAY_URL/llama-3-8b/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "meta-llama/Llama-3.1-8B-Instruct",
@@ -94,46 +197,135 @@ data: {"id":"chatcmpl-abc123","object":"chat.completion.chunk","choices":[{"inde
 data: [DONE]
 ```
 
-## Auto-wake behavior
+## Model status
 
-If a model is sleeping when a request arrives, GreenThread automatically wakes it:
+<ApiEndpoint method="GET" path="/<model>/status" />
 
-1. The request is queued (up to 5,000 per model by default).
-2. The model transitions through `pending` → `activating` → `serving`.
-3. Once serving, queued requests are processed in order.
+Returns the current sidecar state for a model:
 
-The client sees slightly higher latency for the first request (~1.8s from RAM, ~30-40s from disk) but doesn't need any special handling — the response arrives normally.
+```json
+{
+  "model": "llama-3-8b",
+  "state": "serving",
+  "bootReady": true,
+  "queue": {
+    "inFlight": 3,
+    "barriered": false
+  }
+}
+```
 
-<Callout type="tip" title="Pre-warming">
-Use `POST /api/wake` to proactively wake models before traffic arrives. This eliminates first-request latency for predictable workloads.
+| Field | Description |
+|-------|-------------|
+| `state` | Current state: `sleeping`, `pending`, `waking`, `serving`, `deactivating` |
+| `bootReady` | `true` once the sidecar has completed initial boot |
+| `queue.inFlight` | Number of requests currently being processed |
+| `queue.barriered` | `true` during sleep drain — new requests are rejected |
+
+## List models
+
+<ApiEndpoint method="GET" path="/<model>/v1/models" />
+
+Returns the loaded model even when sleeping.
+
+```json
+{
+  "object": "list",
+  "data": [{
+    "id": "meta-llama/Llama-3.1-8B-Instruct",
+    "object": "model",
+    "created": 1773032509,
+    "owned_by": "vllm",
+    "root": "meta-llama/Llama-3.1-8B-Instruct",
+    "max_model_len": 131072
+  }]
+}
+```
+
+## Wake-on-request
+
+If a model is sleeping when an inference request arrives, the sidecar automatically wakes it:
+
+1. The sidecar triggers a wake — the storage agent reloads weights from NVMe into GPU memory
+2. If the GPU is full, the [fairness policy](/fairness-policy) preempts the least-recently-used model first
+3. Once serving, the request is proxied to vLLM and the response streams back
+
+The client sees higher latency on the first request (~600ms from CPU RAM, ~2s from disk with GDS) but the response format is identical. Subsequent requests while the model is serving have no overhead.
+
+<Callout type="info" title="Request queuing">
+During a wake transition, incoming requests are queued (not rejected). During a sleep drain, the barrier activates — new requests receive `503` while in-flight requests complete.
 </Callout>
-
-## Model routing
-
-Requests are routed by the `model` field in the request body. GreenThread matches this against the `model_name` configured for each backend.
 
 ## Error responses
 
 | Status | Meaning |
 |--------|---------|
-| `400` | Invalid request body or parameters |
-| `401` | Missing or invalid API key |
-| `404` | Model not found |
-| `429` | Request queue full (model overloaded) |
-| `502` | Backend error (inference process failed) |
-| `503` | Model in error state |
-| `504` | Request timeout |
+| `502` | Backend error (vLLM process failed) |
+| `503` | Model booting, draining for sleep, or wake failed |
 
-Error responses follow the OpenAI error format:
+## SDK usage
 
-```json
-{
-  "error": {
-    "message": "Model not found: my-model",
-    "type": "not_found",
-    "code": 404
-  }
-}
+### Python (OpenAI SDK)
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://<gateway-url>/llama-3-8b/v1",
+    api_key="not-needed",  # unless auth is configured
+)
+
+response = client.chat.completions.create(
+    model="meta-llama/Llama-3.1-8B-Instruct",
+    messages=[{"role": "user", "content": "Hello!"}],
+)
+print(response.choices[0].message.content)
 ```
 
-See [Model List & Routing](/model-list) for model listing, model-specific proxy endpoints, and per-backend health checks.
+### Python (Anthropic SDK)
+
+```python
+import anthropic
+
+client = anthropic.Anthropic(
+    base_url="http://<gateway-url>/my-model/v1",
+    api_key="not-needed",
+)
+
+message = client.messages.create(
+    model="my-model-name",
+    max_tokens=1024,
+    messages=[{"role": "user", "content": "Hello!"}],
+)
+print(message.content[0].text)
+```
+
+### curl (tool calling)
+
+```bash
+curl http://$GATEWAY_URL/qwen-3-5-35b-a3b/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen/Qwen3.5-35B-A3B",
+    "messages": [{"role": "user", "content": "What is the weather in London?"}],
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "Get weather for a location",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "location": {"type": "string"}
+          },
+          "required": ["location"]
+        }
+      }
+    }],
+    "max_tokens": 256
+  }'
+```
+
+<Callout type="info" title="Tool calling models">
+Tool calling requires `--enable-auto-tool-choice` and `--tool-call-parser` in the Model CRD `extraArgs`. See [Recipes](/recipes) for examples.
+</Callout>

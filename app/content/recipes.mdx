@@ -1,0 +1,246 @@
+import { Callout } from '../components/callout'
+
+Ready-to-use Model CRDs for popular models. Apply any of these with `kubectl apply -f` to deploy on your GreenThread cluster.
+
+## Chat models
+
+### OpenAI GPT-OSS 20B
+
+Standard chat completion model. Good general-purpose performance on a single GPU.
+
+```yaml
+apiVersion: greenthread.ai/v1alpha1
+kind: Model
+metadata:
+  name: gpt-oss-20b
+  namespace: greenthread-system
+spec:
+  modelName: openai/gpt-oss-20b
+  dtype: bfloat16
+  gpuMemoryUtilization: "0.90"
+  tensorParallelSize: 1
+  replicas: 1
+  extraArgs:
+    - "--enforce-eager"
+  fairness: {}
+  kvCache: {}
+  lora: {}
+  sleep: {}
+  staging: {}
+  resources: {}
+```
+
+**VRAM:** ~88.2 GiB per GPU | **GPUs:** 1
+
+### Meta Llama 3.1 8B Instruct
+
+Lightweight instruction-tuned model. Fits comfortably on a single GPU with room for KV cache.
+
+```yaml
+apiVersion: greenthread.ai/v1alpha1
+kind: Model
+metadata:
+  name: llama-3-1-8b
+  namespace: greenthread-system
+spec:
+  modelName: meta-llama/Llama-3.1-8B-Instruct
+  dtype: bfloat16
+  gpuMemoryUtilization: "0.90"
+  tensorParallelSize: 1
+  replicas: 1
+  extraArgs:
+    - "--enforce-eager"
+  fairness: {}
+  kvCache: {}
+  lora: {}
+  sleep: {}
+  staging: {}
+  resources: {}
+```
+
+<Callout type="info" title="Gated model">
+Llama models require a HuggingFace token with access granted. Set your token via `--set huggingfaceToken=hf_xxxx` during Helm install.
+</Callout>
+
+## Reasoning models
+
+### Qwen3 4B Thinking
+
+Compact reasoning model with chain-of-thought capabilities.
+
+```yaml
+apiVersion: greenthread.ai/v1alpha1
+kind: Model
+metadata:
+  name: qwen-3-4b-thinking-2507
+  namespace: greenthread-system
+spec:
+  modelName: Qwen/Qwen3-4B-Thinking-2507
+  dtype: bfloat16
+  gpuMemoryUtilization: "0.90"
+  tensorParallelSize: 1
+  replicas: 1
+  extraArgs:
+    - "--enforce-eager"
+  fairness: {}
+  kvCache: {}
+  lora: {}
+  sleep: {}
+  staging: {}
+  resources: {}
+```
+
+**VRAM:** ~87.9 GiB per GPU | **GPUs:** 1
+
+## MoE models with tool calling
+
+### Qwen3.5 35B-A3B (MoE)
+
+Mixture-of-Experts model with 35B total parameters, 3B active. Includes reasoning support and tool calling via the Qwen3 parser.
+
+```yaml
+apiVersion: greenthread.ai/v1alpha1
+kind: Model
+metadata:
+  name: qwen-3-5-35b-a3b
+  namespace: greenthread-system
+spec:
+  modelName: Qwen/Qwen3.5-35B-A3B
+  dtype: bfloat16
+  gpuMemoryUtilization: "0.90"
+  tensorParallelSize: 1
+  replicas: 1
+  extraArgs:
+    - "--enforce-eager"
+    - "--reasoning-parser"
+    - "qwen3"
+    - "--enable-auto-tool-choice"
+    - "--tool-call-parser"
+    - "qwen3_coder"
+  fairness: {}
+  kvCache: {}
+  lora: {}
+  sleep: {}
+  staging: {}
+  resources: {}
+```
+
+**VRAM:** ~87.8 GiB per GPU | **GPUs:** 1
+
+<Callout type="tip" title="Tool calling">
+The `--enable-auto-tool-choice` and `--tool-call-parser` flags enable native tool/function calling. Pass `tools` in your chat completion request and the model will generate structured tool calls.
+</Callout>
+
+## Vision-language models
+
+### Kimi-VL A3B Thinking
+
+Multimodal vision-language model with thinking capabilities. Processes images alongside text.
+
+```yaml
+apiVersion: greenthread.ai/v1alpha1
+kind: Model
+metadata:
+  name: kimi-vl-s3b-thinking-2506
+  namespace: greenthread-system
+spec:
+  modelName: moonshotai/Kimi-VL-A3B-Thinking-2506
+  dtype: bfloat16
+  gpuMemoryUtilization: "0.90"
+  tensorParallelSize: 1
+  replicas: 1
+  extraArgs:
+    - "--enforce-eager"
+    - "--trust-remote-code"
+  fairness: {}
+  kvCache: {}
+  lora: {}
+  sleep: {}
+  staging: {}
+  resources: {}
+```
+
+**VRAM:** ~87.9 GiB per GPU | **GPUs:** 1
+
+<Callout type="warning" title="Trust remote code">
+Vision-language models often require `--trust-remote-code` because they use custom model architectures not yet merged into the transformers library.
+</Callout>
+
+## Multi-GPU models
+
+### Large models with tensor parallelism
+
+For models that exceed a single GPU's memory, use `tensorParallelSize` to shard across multiple GPUs. The value must be a power of 2.
+
+```yaml
+apiVersion: greenthread.ai/v1alpha1
+kind: Model
+metadata:
+  name: llama-3-1-70b
+  namespace: greenthread-system
+spec:
+  modelName: meta-llama/Llama-3.1-70B-Instruct
+  dtype: bfloat16
+  gpuMemoryUtilization: "0.90"
+  tensorParallelSize: 2
+  replicas: 1
+  extraArgs:
+    - "--enforce-eager"
+  fairness: {}
+  kvCache: {}
+  lora: {}
+  sleep: {}
+  staging: {}
+  resources: {}
+```
+
+**GPUs:** 2 (tensor parallel)
+
+## Configuration tips
+
+### `extraArgs` reference
+
+Common vLLM arguments passed via `extraArgs`:
+
+| Argument | Description |
+|----------|-------------|
+| `--enforce-eager` | Disable CUDA graphs. Recommended for sleep/wake compatibility. |
+| `--trust-remote-code` | Allow custom model code from HuggingFace. Required for some architectures. |
+| `--max-model-len <n>` | Override the maximum sequence length. Reduces VRAM usage for long-context models. |
+| `--max-num-seqs <n>` | Maximum concurrent sequences. Lower values reduce VRAM usage. |
+| `--reasoning-parser <name>` | Enable reasoning/thinking token parsing (e.g. `qwen3`, `deepseek`). |
+| `--enable-auto-tool-choice` | Enable automatic tool/function calling. |
+| `--tool-call-parser <name>` | Tool call parser to use (e.g. `qwen3_coder`, `hermes`). |
+| `--quantization <method>` | Runtime quantization (e.g. `awq`, `gptq`). |
+
+### Fitting more models per GPU
+
+To fit multiple models on the same GPU:
+
+- Lower `gpuMemoryUtilization` (e.g. `"0.50"`) to leave room for other models
+- Use `--max-model-len` to cap sequence length and reduce KV cache VRAM
+- Use smaller or quantized models
+- GreenThread's sleep/wake system automatically time-shares GPUs — sleeping models release their VRAM entirely
+
+### Fairness tuning
+
+Control preemption behavior per model:
+
+```yaml
+spec:
+  fairness:
+    popular: true          # Never preempted — stays on GPU permanently
+    minRuntime: 60s        # Must serve for at least 60s before preemption
+    maxWaitTime: 30s       # Can preempt others after waiting 30s
+```
+
+### Sleep tuning
+
+Control when models go to sleep:
+
+```yaml
+spec:
+  sleep:
+    idleTimeout: 5m        # Sleep after 5 minutes with no requests
+    drainTimeout: 30s      # Max wait for in-flight requests to finish
+```

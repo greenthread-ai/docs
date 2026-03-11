@@ -1,0 +1,457 @@
+import { Callout } from '../components/callout'
+
+This guide walks through setting up an Amazon EKS cluster with GPU nodes for GreenThread. After completing this page, continue to [Prerequisites](/k8s-prerequisites) to install the GPU Operator, DRA Driver, and Envoy Gateway.
+
+## Install CLI tools
+
+```bash
+# AWS CLI
+brew install awscli
+
+# kubectl
+brew install kubectl
+
+# eksctl
+brew install eksctl
+
+# Helm
+brew install helm
+```
+
+Configure the AWS CLI with credentials that have permission to manage EKS, EC2, IAM, and CloudFormation:
+
+```bash
+aws configure
+# AWS Access Key ID: <your-key>
+# AWS Secret Access Key: <your-secret>
+# Default region name: us-west-2
+# Default output format: json
+```
+
+<Callout type="tip" title="Access keys">
+Create access keys in the AWS Console under your username, then **Security credentials**, then **Access keys**, then **Create access key**.
+</Callout>
+
+## Create the EKS cluster
+
+Create a cluster via the AWS Console or the CLI. Navigate to **EKS** then **Create cluster** and configure:
+
+- **Kubernetes version:** 1.35
+- **Networking:** Select a VPC with public subnets
+
+Alternatively, via CLI:
+
+```bash
+aws eks create-cluster \
+  --name <cluster-name> \
+  --role-arn <cluster-role-arn> \
+  --resources-vpc-config subnetIds=<subnet-ids>,securityGroupIds=<sg-id> \
+  --kubernetes-version 1.35 \
+  --region us-west-2
+```
+
+<Callout type="warning" title="Console-created clusters">
+Clusters created via the console do **not** install core add-ons (VPC CNI, kube-proxy, CoreDNS) automatically. These must be installed manually — see the add-ons section below.
+</Callout>
+
+## Configure kubectl access
+
+Merge the cluster's kubeconfig into your local configuration:
+
+```bash
+aws eks update-kubeconfig --name <cluster-name> --region us-west-2
+```
+
+Verify access:
+
+```bash
+kubectl get svc
+```
+
+The IAM principal that created the cluster is the only identity with access by default. If your CLI credentials differ from the console user, add your identity via EKS access entries:
+
+```bash
+aws eks create-access-entry \
+  --cluster-name <cluster-name> \
+  --principal-arn arn:aws:iam::<account>:user/<your-user> \
+  --region us-west-2
+
+aws eks associate-access-policy \
+  --cluster-name <cluster-name> \
+  --principal-arn arn:aws:iam::<account>:user/<your-user> \
+  --policy-arn arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy \
+  --access-scope type=cluster \
+  --region us-west-2
+```
+
+## Install EKS add-ons
+
+Console-created clusters ship with no networking stack. Install the three core add-ons:
+
+```bash
+# VPC CNI — pod networking
+aws eks create-addon --cluster-name <cluster-name> --addon-name vpc-cni --region us-west-2
+
+# kube-proxy — service networking
+aws eks create-addon --cluster-name <cluster-name> --addon-name kube-proxy --region us-west-2
+
+# CoreDNS — cluster DNS
+aws eks create-addon --cluster-name <cluster-name> --addon-name coredns --region us-west-2
+```
+
+Verify:
+
+```bash
+kubectl get ds -n kube-system    # Should show aws-node, kube-proxy
+kubectl get pods -n kube-system  # All pods should be Running
+```
+
+## Prepare networking
+
+### Gather VPC details
+
+```bash
+aws eks describe-cluster --name <cluster-name> --region us-west-2 \
+  --query "cluster.resourcesVpcConfig.{vpcId:vpcId,subnetIds:subnetIds,securityGroup:clusterSecurityGroupId}" \
+  --output json
+```
+
+### Identify subnets
+
+```bash
+aws ec2 describe-subnets --subnet-ids <subnet-id-1> <subnet-id-2> \
+  --query "Subnets[*].{Id:SubnetId,AZ:AvailabilityZone,Public:MapPublicIpOnLaunch}" \
+  --output table --region us-west-2
+```
+
+### Tag subnets for load balancer discovery
+
+The AWS Load Balancer Controller requires subnet tags to discover where to provision NLBs.
+
+For **public** subnets (internet-facing load balancers):
+
+```bash
+aws ec2 create-tags --resources <subnet-id-1> <subnet-id-2> <subnet-id-3> \
+  --tags Key=kubernetes.io/role/elb,Value=1 \
+  --region us-west-2
+```
+
+For **private** subnets (internal load balancers):
+
+```bash
+aws ec2 create-tags --resources <subnet-id-1> <subnet-id-2> \
+  --tags Key=kubernetes.io/role/internal-elb,Value=1 \
+  --region us-west-2
+```
+
+Tag all subnets as belonging to the cluster:
+
+```bash
+aws ec2 create-tags --resources <all-subnet-ids> \
+  --tags Key=kubernetes.io/cluster/<cluster-name>,Value=shared \
+  --region us-west-2
+```
+
+## Create the GPU node group
+
+### Find the Ubuntu 24.04 EKS AMI
+
+Canonical publishes EKS-optimised Ubuntu 24.04 LTS AMIs. Retrieve the AMI ID via SSM:
+
+```bash
+aws ssm get-parameter \
+  --name /aws/service/canonical/ubuntu/eks/24.04/<eks-version>/stable/current/amd64/hvm/ebs-gp3/ami-id \
+  --region us-west-2 \
+  --query "Parameter.Value" --output text
+```
+
+<Callout type="info" title="AMI lookup">
+Ubuntu 24.04 uses `ebs-gp3`, not `ebs-gp2`. If the SSM path doesn't resolve, `eksctl` will auto-discover the AMI when `amiFamily: Ubuntu2404` is set.
+</Callout>
+
+Alternatively, search EC2 images directly:
+
+```bash
+aws ec2 describe-images --region us-west-2 \
+  --owners 099720109477 \
+  --filters 'Name=name,Values=ubuntu-eks/k8s_1.35/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*' \
+  --query 'Images | sort_by(@, &CreationDate) | [-1].[ImageId,Name]' \
+  --output text
+```
+
+### Node group configuration
+
+Create `gpu-nodegroup.yaml` with the following configuration. The bootstrap script handles three critical tasks:
+
+1. **Install `xfsprogs`** — required for XFS formatting (GDS compatibility) and not present in the Ubuntu EKS minimal AMI
+2. **Enable hugepages** — GreenThread's storage agent requires 8Gi of 2Mi hugepages for pinned memory and GPU data transfers
+3. **Mount NVMe instance storage** — ephemeral NVMe SSDs are mounted to `/mnt/models` for high-throughput model storage
+
+```yaml
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+
+metadata:
+  name: <cluster-name>
+  region: us-west-2
+
+vpc:
+  id: "<vpc-id>"
+  securityGroup: "<cluster-security-group-id>"
+  subnets:
+    public:
+      us-west-2a:
+        id: "<subnet-id-a>"
+      us-west-2b:
+        id: "<subnet-id-b>"
+      us-west-2c:
+        id: "<subnet-id-c>"
+      us-west-2d:
+        id: "<subnet-id-d>"
+
+managedNodeGroups:
+  - name: gpu-nodes
+    instanceType: g7e.12xlarge
+    ami: <ami-id>
+    amiFamily: Ubuntu2404
+    minSize: 1
+    maxSize: 2
+    desiredCapacity: 2
+    volumeSize: 500
+    # Pin all nodes to a single AZ (required for EFA)
+    availabilityZones:
+      - us-west-2a
+    # Enable EFA for high-bandwidth inter-node model transfers
+    efaEnabled: true
+    # Cluster placement group for full EFA bandwidth
+    placement:
+      groupName: <placement-group-name>
+    overrideBootstrapCommand: |
+      #!/bin/bash
+      set -ex
+
+      # Install xfsprogs (required for XFS / GPUDirect Storage support)
+      apt-get update && apt-get install -y xfsprogs
+
+      # Enable hugepages — 4096 x 2Mi = 8Gi
+      echo 4096 > /proc/sys/vm/nr_hugepages
+      echo "vm.nr_hugepages=4096" >> /etc/sysctl.conf
+
+      # Find and mount NVMe instance store to /mnt/models
+      DEVICE=$(lsblk -dpno NAME,MODEL | grep "Instance Storage" | awk '{print $1}')
+      if [ -z "$DEVICE" ]; then
+        DEVICE=$(lsblk -dpno NAME | grep nvme | while read d; do
+          if ! lsblk -no MOUNTPOINT "$d" | grep -q '/'; then
+            echo "$d"; break
+          fi
+        done)
+      fi
+
+      if [ -n "$DEVICE" ]; then
+        mkfs.xfs -f "$DEVICE"
+        mkdir -p /mnt/models
+        mount "$DEVICE" /mnt/models
+        echo "$DEVICE /mnt/models xfs defaults,noatime 0 0" >> /etc/fstab
+      fi
+
+      # Bootstrap EKS
+      /etc/eks/bootstrap.sh <cluster-name>
+```
+
+<Callout type="info" title="Console-created clusters">
+The VPC section is required because `eksctl` cannot auto-discover VPC details from non-eksctl-managed clusters.
+</Callout>
+
+### EFA and multi-node networking
+
+When running multiple GPU nodes, GreenThread's storage servers form a cluster and can transfer model weights between nodes on demand. Enabling EFA (Elastic Fabric Adapter) dramatically accelerates these transfers.
+
+#### Why EFA matters
+
+G7e instances support up to 400 Gbps (g7e.12xlarge) or 1600 Gbps (g7e.48xlarge) of network bandwidth with EFA — compared to ~20 Gbps over standard TCP without it. At 400 Gbps, a 32 GB model transfers between nodes in under a second, which means you don't need to store every model on every node.
+
+EFA also enables **GPUDirect RDMA**, allowing the network adapter to write directly to GPU memory without CPU involvement.
+
+#### Requirements
+
+EFA has three hard requirements:
+
+1. **Single Availability Zone** — EFA traffic cannot cross AZs. All GPU nodes must be in the same AZ, configured via `availabilityZones` in the node group.
+2. **Cluster placement group** — required for full EFA bandwidth. Create one before the node group:
+   ```bash
+   aws ec2 create-placement-group \
+     --group-name <placement-group-name> \
+     --strategy cluster \
+     --region us-west-2
+   ```
+3. **Security group self-referencing rule** — the cluster security group must allow all traffic from itself. EKS clusters typically have this by default. Verify:
+   ```bash
+   aws ec2 describe-security-groups --group-ids <sg-id> \
+     --query "SecurityGroups[0].IpPermissions[?IpProtocol=='-1'].UserIdGroupPairs[].GroupId" \
+     --output text --region us-west-2
+   # Should include the security group's own ID
+   ```
+
+#### Install the EFA device plugin
+
+After the node group is created, install the EFA Kubernetes device plugin. This exposes EFA interfaces as schedulable resources (`vpc.amazonaws.com/efa`):
+
+```bash
+helm repo add eks https://aws.github.io/eks-charts
+helm repo update
+
+helm install aws-efa-k8s-device-plugin \
+  --namespace kube-system \
+  eks/aws-efa-k8s-device-plugin \
+  --set "supportedInstanceLabels.keys={node.kubernetes.io/instance-type}" \
+  --set "supportedInstanceLabels.values={g7e.12xlarge,g7e.24xlarge,g7e.48xlarge}"
+```
+
+<Callout type="warning" title="Instance type allowlist">
+The EFA device plugin chart ships with a hardcoded list of supported instance types that may not include newer instances like g7e. The `supportedInstanceLabels` override above ensures the plugin schedules on g7e nodes. Adjust the values list to match your instance types.
+</Callout>
+
+Verify EFA is detected on the nodes:
+
+```bash
+kubectl get nodes -o json | \
+  jq '.items[] | {name: .metadata.name, efa: .status.capacity["vpc.amazonaws.com/efa"]}'
+```
+
+Each EFA-enabled node should show `"efa": "1"` (or more, depending on instance size).
+
+<Callout type="tip" title="Single-node deployments">
+EFA is only needed for multi-node clusters. If you're running a single GPU node, you can omit `efaEnabled`, `placement`, and `availabilityZones` from the node group config.
+</Callout>
+
+### Instance type reference
+
+| Instance Type | GPUs | GPU Model | GPU Memory | NVMe Storage | vCPUs | RAM | Network | EFA |
+|---|---|---|---|---|---|---|---|---|
+| `g7e.2xlarge` | 1 | RTX PRO 6000 Blackwell | 96 GB | 1.9 TB | 8 | 64 GiB | 50 Gbps | No |
+| `g7e.4xlarge` | 1 | RTX PRO 6000 Blackwell | 96 GB | 1.9 TB | 16 | 128 GiB | 100 Gbps | No |
+| `g7e.8xlarge` | 1 | RTX PRO 6000 Blackwell | 96 GB | 1.9 TB | 32 | 256 GiB | 200 Gbps | No |
+| `g7e.12xlarge` | 2 | RTX PRO 6000 Blackwell | 192 GB | 3.8 TB | 48 | 512 GiB | 400 Gbps | Yes |
+| `g7e.24xlarge` | 4 | RTX PRO 6000 Blackwell | 384 GB | 7.6 TB | 96 | 1024 GiB | 800 Gbps | Yes |
+| `g7e.48xlarge` | 8 | RTX PRO 6000 Blackwell | 768 GB | 15.2 TB | 192 | 2048 GiB | 1600 Gbps | Yes |
+
+### Create the node group
+
+```bash
+eksctl create nodegroup --config-file=gpu-nodegroup.yaml
+```
+
+### Attach IAM policies to the node role
+
+The node role needs permissions for EC2 operations and ELB management:
+
+```bash
+# Find the node role
+aws eks describe-nodegroup \
+  --cluster-name <cluster-name> \
+  --nodegroup-name gpu-nodes \
+  --region us-west-2 \
+  --query "nodegroup.nodeRole" --output text
+
+# Attach required policies
+aws iam attach-role-policy \
+  --role-name <node-role-name> \
+  --policy-arn arn:aws:iam::aws:policy/ElasticLoadBalancingFullAccess
+
+aws iam attach-role-policy \
+  --role-name <node-role-name> \
+  --policy-arn arn:aws:iam::aws:policy/AmazonEC2FullAccess
+```
+
+<Callout type="warning" title="Production IAM">
+For production environments, use the [scoped IAM policy](https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/main/docs/install/iam_policy.json) from the AWS Load Balancer Controller documentation instead of `FullAccess` policies.
+</Callout>
+
+### Verify the nodes
+
+```bash
+kubectl get nodes -o wide
+
+# Check hugepages are present
+kubectl describe node <gpu-node-name> | grep -i hugepages
+
+# Expected output:
+#   hugepages-2Mi: 8Gi   (in both Capacity and Allocatable)
+```
+
+If EFA is enabled, also verify:
+
+```bash
+# Check EFA resources are advertised
+kubectl get nodes -o json | \
+  jq '.items[] | select(.status.capacity["vpc.amazonaws.com/efa"]) | {name: .metadata.name, efa: .status.capacity["vpc.amazonaws.com/efa"]}'
+
+# Check all nodes are in the same AZ
+kubectl get nodes -L topology.kubernetes.io/zone
+```
+
+## Install the AWS Load Balancer Controller
+
+EKS does not include a load balancer controller by default. The controller must be installed with **IAM Roles for Service Accounts (IRSA)** — using node instance roles and IMDS does not work reliably because EKS managed nodes default to IMDS hop limit 1, which prevents pods from reaching the instance metadata service.
+
+### Create the OIDC provider
+
+IRSA requires an OIDC identity provider associated with the cluster:
+
+```bash
+eksctl utils associate-iam-oidc-provider \
+  --cluster <cluster-name> \
+  --region us-west-2 \
+  --approve
+```
+
+### Create the IAM service account
+
+```bash
+eksctl create iamserviceaccount \
+  --cluster <cluster-name> \
+  --region us-west-2 \
+  --namespace kube-system \
+  --name aws-load-balancer-controller \
+  --attach-policy-arn arn:aws:iam::aws:policy/ElasticLoadBalancingFullAccess \
+  --attach-policy-arn arn:aws:iam::aws:policy/AmazonEC2FullAccess \
+  --approve
+```
+
+Verify the service account was created with the IRSA annotation:
+
+```bash
+kubectl get sa aws-load-balancer-controller -n kube-system -o yaml | grep role-arn
+```
+
+### Install the controller via Helm
+
+```bash
+helm repo add eks https://aws.github.io/eks-charts
+helm repo update
+
+helm install aws-load-balancer-controller eks/aws-load-balancer-controller \
+  -n kube-system \
+  --set clusterName=<cluster-name> \
+  --set serviceAccount.create=false \
+  --set serviceAccount.name=aws-load-balancer-controller \
+  --set region=us-west-2 \
+  --set vpcId=<vpc-id>
+```
+
+<Callout type="warning" title="Service account">
+`serviceAccount.create=false` tells Helm to use the existing IRSA-annotated service account. Setting this to `true` will overwrite the IRSA annotation and break AWS credentials.
+</Callout>
+
+### Verify
+
+```bash
+kubectl get pods -n kube-system -l app.kubernetes.io/name=aws-load-balancer-controller
+
+# Check logs for successful startup (no IMDS or credential errors)
+kubectl logs -n kube-system -l app.kubernetes.io/name=aws-load-balancer-controller --tail=20
+```
+
+## Next steps
+
+Continue to [Prerequisites](/k8s-prerequisites) to install the NVIDIA GPU Operator, DRA Driver, and Envoy Gateway.

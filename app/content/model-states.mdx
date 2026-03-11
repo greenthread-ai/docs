@@ -1,201 +1,239 @@
-import { ApiEndpoint } from '../components/api-endpoint'
+import { Callout } from '../components/callout'
 import { Mermaid } from '../components/mermaid'
 
-Models in GreenThread follow a state machine with seven states. Understanding these states helps you monitor your deployment and build integrations.
+Models in GreenThread have two layers of state: the **Model CRD phase** (managed by the controller) and the **sidecar state** (managed by the sidecar proxy in each model pod). Understanding both helps you monitor deployments and debug issues.
 
-## States
+## Model CRD phases
 
-| State | Description | VRAM Usage |
-|-------|-------------|------------|
-| `offline` | Container not started | None |
-| `sleeping` | Inference process running but dormant | ~300-400MB |
-| `pending` | Sleeping, waiting for GPU slot | ~300-400MB |
-| `activating` | Restoring tensors to GPU | Growing |
-| `serving` | Actively handling requests | Full allocation |
-| `deactivating` | Draining in-flight requests | Full allocation |
-| `error` | Startup or runtime failure | Variable |
+The Model custom resource progresses through lifecycle phases as the controller reconciles it.
 
-## State transitions
+| Phase | Description |
+|-------|-------------|
+| `Pending` | Model resource created, waiting for processing |
+| `Converting` | Downloading from HuggingFace and converting to `gthread` load format on NVMe |
+| `Staging` | Weights are being staged (verified on disk or loaded into CPU memory) |
+| `Ready` | Model is ready for inference — pod is running, either serving or sleeping |
+| `Failed` | Conversion or pod creation failed |
 
 <Mermaid chart={`
 stateDiagram-v2
-    [*] --> offline
-    offline --> sleeping: start
-    sleeping --> activating: wake (GPU available)
-    sleeping --> pending: wake (no GPU)
-    pending --> activating: GPU freed
-    activating --> serving: ready
-    serving --> deactivating: sleep request
-    deactivating --> sleeping: drained
-    serving --> sleeping: sleep (no in-flight)
-    activating --> sleeping: cancelled
-    sleeping --> offline: stop
-    serving --> error: failure
-    activating --> error: failure
-    offline --> error: start failure
+    [*] --> Pending: kubectl apply
+    Pending --> Converting: controller starts conversion job
+    Converting --> Staging: conversion complete
+    Staging --> Ready: staging verified, pod created
+    Ready --> Ready: sleep/wake cycles
+    Converting --> Failed: download or conversion error
+    Staging --> Failed: staging error
+    Ready --> Failed: pod crash
 `} />
 
-The `error` state can occur from any state.
+Check the current phase:
 
-## REST API endpoints
+```bash
+kubectl get model -A
+```
 
-### List models with status
+```
+NAMESPACE            NAME                PHASE   REPLICAS   SERVING   SLEEPING   NODE        GPUS   VRAM/GPU
+greenthread-system   llama-3-1-8b        Ready   1          0         1          gpu-node1   0      17.2 GiB
+greenthread-system   qwen-3-5-35b-a3b    Ready   1          1         0          gpu-node1   1      88.2 GiB
+```
 
-<ApiEndpoint method="GET" path="/v1/models" />
+### Conversion
 
-Returns all models with their current state.
+During the `Converting` phase, the controller creates a Kubernetes Job that:
+
+1. Downloads model weights from HuggingFace (using the `huggingfaceToken` from Helm values)
+2. Converts weights to the `gthread` load format optimized for fast sleep/wake
+3. Stores the converted model on NVMe at the host path configured by `storage.modelsPath`
+
+Track conversion progress:
+
+```bash
+kubectl get model llama-3-1-8b -n greenthread-system -o jsonpath='{.status.conversion}'
+```
+
+Once conversion completes on one node, the storage agent distributes the model to other GPU nodes via peer-to-peer transfer.
+
+### Multi-node distribution
+
+After conversion, the model may need to be available on multiple nodes. The status tracks this:
+
+```bash
+kubectl get model llama-3-1-8b -n greenthread-system \
+  -o jsonpath='{.status.distribution.availableOnNodes}'
+```
+
+Storage agents on each node discover peers via DNS and can pull models from any node that has them, avoiding redundant HuggingFace downloads.
+
+## Sidecar states
+
+Once a model reaches the `Ready` phase, its pod runs a sidecar proxy that manages the model's runtime state. The sidecar has five states:
+
+| State | Description | VRAM Usage |
+|-------|-------------|------------|
+| `sleeping` | Process running, GPU memory fully released | **0 bytes** |
+| `pending` | Sleeping, waiting for GPU memory (preemption may be needed) | 0 bytes |
+| `waking` | Acquiring GPU memory and reloading weights | Growing |
+| `serving` | Actively handling inference requests | Full allocation |
+| `deactivating` | Draining in-flight requests before sleep | Full allocation |
+
+<Mermaid chart={`
+stateDiagram-v2
+    [*] --> sleeping: pod boot (initial state)
+    sleeping --> pending: inference request arrives
+    pending --> waking: GPU memory available
+    waking --> serving: weights loaded
+    serving --> deactivating: idle timeout or preemption
+    deactivating --> sleeping: requests drained, GPU released
+    serving --> sleeping: sleep (no in-flight requests)
+    pending --> waking: preemption frees memory
+`} />
+
+<Callout type="info" title="True zero VRAM">
+When sleeping, GreenThread releases **all** GPU memory — not just most of it. Sleeping models consume exactly 0 bytes of VRAM, making the GPU fully available for other models.
+</Callout>
+
+### Check sidecar state
+
+Each model exposes a `/status` endpoint through the gateway:
+
+```bash
+GATEWAY_URL=$(kubectl get gateway -n greenthread-system greenthread-gateway \
+  -o jsonpath='{.status.addresses[0].value}')
+
+curl http://$GATEWAY_URL/llama-3-1-8b/status
+```
 
 ```json
 {
-  "object": "list",
-  "data": [
-    {
-      "id": "llama-3-8b/meta-llama/Meta-Llama-3-8B-Instruct",
-      "model_name": "meta-llama/Meta-Llama-3-8B-Instruct",
-      "backend_name": "llama-3-8b",
-      "object": "model",
-      "created": 0,
-      "owned_by": "engine",
-      "status": "serving"
-    }
-  ]
+  "model": "llama-3-1-8b",
+  "state": "sleeping",
+  "bootReady": true,
+  "queue": {
+    "inFlight": 0,
+    "barriered": false
+  }
 }
 ```
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `id` | string | Format: `{backend_name}/{model_name}` |
-| `model_name` | string | HuggingFace model identifier |
-| `backend_name` | string | Unique backend identifier for routing |
-| `status` | string | Current state |
-| `error` | string | Error message (only when status is `"error"`) |
+| Field | Description |
+|-------|-------------|
+| `state` | Current sidecar state |
+| `bootReady` | `true` once the sidecar has completed initial boot |
+| `queue.inFlight` | Number of requests currently being processed |
+| `queue.barriered` | `true` during sleep drain — new requests are rejected with `503` |
 
-### System health
+## Sleep flow
 
-<ApiEndpoint method="GET" path="/health" />
+When a model transitions from serving to sleeping (either voluntary idle timeout or preemption):
 
-Returns overall system health with component-level detail.
+1. **State → `deactivating`** — the sidecar activates the preemption barrier
+2. **Barrier stops new requests** — `TryClaimRequest()` returns `false`, new requests get `503`
+3. **Drain in-flight requests** — waits up to `drainTimeout` for active requests to complete
+4. **Release GPU** — GreenThread releases all GPU memory (true zero VRAM)
+5. **Release memory** — updates GPU CRD occupant from `serving` → `sleeping` with `reservedMemoryBytes: 0`
+6. **State → `sleeping`** — model is fully asleep, GPU memory is free
 
-- `200` — Healthy or degraded
-- `503` — Unhealthy (critical component down)
+### Idle timeout
 
-```json
-{
-  "status": "healthy",
-  "components": {
-    "engine": {"status": "healthy"},
-    "storage": {"status": "healthy"},
-    "licence": {"status": "healthy"},
-    "models": {"status": "healthy"}
-  },
-  "models": [
-    {"name": "meta-llama/Llama-3.1-8B-Instruct", "status": "serving"}
-  ],
-  "uptime_seconds": 3600.5,
-  "timestamp": "2025-11-25T12:00:00Z"
-}
+The sidecar monitors request activity. If no requests arrive for `sleep.idleTimeout` (default: 5 minutes), the model voluntarily sleeps. The idle timer resets on every request.
+
+The model must also have been serving for at least `fairness.minRuntime` before it can sleep voluntarily, preventing rapid sleep/wake cycles.
+
+### Preemption-triggered sleep
+
+When another model needs GPU memory and triggers preemption, it writes a `PreemptionIntent` to the GPU CRD. The victim model's sidecar detects this via the preemption watcher (polling every 2 seconds) and initiates involuntary sleep, following the same drain-and-checkpoint flow.
+
+## Wake flow
+
+When an inference request arrives for a sleeping model:
+
+1. **State → `pending`** — request is queued, sidecar checks if model fits on GPU
+2. **Check fit** — reads GPU CRDs to see if there's enough available memory
+3. **If fits → `waking`** — acquires wake locks, claims memory budget on GPU CRDs
+4. **If doesn't fit → preemption flow**:
+   - Adds `PreemptionIntent` to GPU CRDs (signals other sidecars)
+   - Waits `fairness.maxWaitTime` — another model might voluntarily sleep
+   - If still doesn't fit, selects LRU non-popular victim and signals preemption
+   - Waits for victim to release memory (polls GPU CRD occupant state)
+5. **Reload weights** — calls vLLM to reload model weights via the storage agent
+6. **Wake vLLM** — restores KV cache and inference state
+7. **State → `serving`** — requests are dequeued and processed
+
+### Wake deduplication
+
+If multiple requests arrive while a model is waking, they share the same wake operation. The sidecar tracks an in-flight wake result and additional callers wait for the same outcome. This prevents redundant wake attempts.
+
+### Wake times
+
+Wake latency depends on the storage tier where model weights are staged:
+
+| Source | Approximate wake time | Description |
+|--------|----------------------|-------------|
+| CPU pinned RAM | ~600ms | DMA transfer from pinned host memory to GPU (~65 GB/s) |
+| NVMe disk (GDS) | ~2 seconds | GPU Direct Storage transfer (~20 GB/s) |
+| NVMe disk (no GDS) | ~5-6 seconds | Memory-mapped copy fallback |
+
+Configure fast wake by setting `staging.pinned: true` in the Model CRD. See [Storage & Pinning](/storage-pinning).
+
+## GPU CRD occupant tracking
+
+The GPU custom resource tracks which models occupy each GPU:
+
+```bash
+kubectl get gpu -A -o yaml
 ```
 
-### Model health
+Each GPU's `status.occupants` list shows:
 
-<ApiEndpoint method="GET" path="/api/models/:model_id/health" />
+| Field | Description |
+|-------|-------------|
+| `podName` | Pod that owns this occupant slot |
+| `modelName` | Model loaded by this occupant |
+| `state` | `serving`, `sleeping`, or `converting` |
+| `reservedMemoryBytes` | GPU memory reserved (0 when sleeping) |
+| `popular` | Whether the model is protected from preemption |
+| `lastAccessed` | Timestamp of last inference request |
+| `becameServingAt` | When this occupant last transitioned to serving |
 
-Health check for a specific model by its `backend_name`.
+The sidecar updates these fields via optimistic CAS (compare-and-swap) updates to the GPU CRD status. If a concurrent update conflicts, the sidecar retries.
 
-- `200` — Model exists and is not in error state
-- `404` — Model not found
-- `503` — Model is in error state
+## Troubleshooting states
 
-```json
-{
-  "backend_name": "llama-3-8b",
-  "model_name": "meta-llama/Meta-Llama-3-8B-Instruct",
-  "status": "serving",
-  "healthy": true,
-  "timestamp": "2025-11-25T12:00:00Z"
-}
+### Model stuck in `Converting`
+
+Check the conversion job:
+
+```bash
+kubectl get jobs -n greenthread-system | grep <model-name>
+kubectl logs job/<model-name>-convert -n greenthread-system
 ```
 
-### Wake a model
+Common causes: HuggingFace token missing or invalid, model requires access approval, insufficient disk space.
 
-<ApiEndpoint method="POST" path="/api/wake" />
+### Model stuck in `Pending`
 
-Transitions a model from sleeping to serving.
+The controller hasn't started processing yet. Check controller logs:
 
-```json
-{"model": "llama-3-8b"}
+```bash
+kubectl logs -n greenthread-system -l app=gthread-controller --tail=30
 ```
 
-**Response:**
+### Sidecar stuck in `waking`
 
-```json
-{
-  "status": "success",
-  "old_state": "sleeping",
-  "new_state": "serving",
-  "duration_ms": 1800,
-  "timed_out": false
-}
+The model can't acquire GPU memory. Check GPU occupants:
+
+```bash
+kubectl get gpu -A -o jsonpath='{range .items[*]}{.metadata.name}: {.status.occupants}{"\n"}{end}'
 ```
 
-### Sleep a model
+If all GPUs are occupied by popular models, preemption cannot proceed. Either remove the `popular` flag from a model or add more GPU capacity.
 
-<ApiEndpoint method="POST" path="/api/sleep" />
+### Sidecar stuck in `pending`
 
-Transitions a model from serving to sleeping. In-flight requests are drained before the model sleeps.
+Similar to stuck waking — the model is waiting for GPU memory. Check for preemption intents:
 
-```json
-{"model": "llama-3-8b"}
-```
-
-### System metrics
-
-<ApiEndpoint method="GET" path="/api/metrics/system" />
-
-Returns GPU utilization and model placement information.
-
-```json
-{
-  "timestamp": "2025-11-25T12:00:00Z",
-  "gpus": [
-    {
-      "index": 0,
-      "name": "NVIDIA A100-SXM4-80GB",
-      "total_memory_mib": 81920,
-      "used_memory_mib": 45000,
-      "free_memory_mib": 36920,
-      "utilization_percent": 65,
-      "temperature_celsius": 72
-    }
-  ],
-  "models": [
-    {
-      "backend_name": "llama-3-8b",
-      "model_name": "meta-llama/Meta-Llama-3-8B-Instruct",
-      "status": "serving",
-      "gpu_index": 0,
-      "gpu_memory_used_mib": 16384,
-      "last_accessed": "2025-11-25T11:59:30Z"
-    }
-  ]
-}
-```
-
-### Agent info
-
-<ApiEndpoint method="GET" path="/agent/info" />
-
-Returns agent metadata and connected model list.
-
-```json
-{
-  "site_id": "tenant_00000001",
-  "org_id": "org_00000001",
-  "node_id": "agent_00000001",
-  "nats_connected": true,
-  "started_at": "2025-11-25T08:00:00Z",
-  "uptime_seconds": 14400.5,
-  "models_loaded": 3,
-  "models": ["llama-3-8b", "mistral-7b", "qwen-14b"]
-}
+```bash
+kubectl get gpu -A -o jsonpath='{range .items[*]}{.metadata.name}: {.status.preemptionIntents}{"\n"}{end}'
 ```

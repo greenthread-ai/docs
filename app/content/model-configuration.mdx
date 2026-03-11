@@ -1,166 +1,324 @@
 import { Callout } from '../components/callout'
 
-The `vllm_config` object controls how the inference engine runs your model. These settings are passed when [adding a model](/adding-removing-models) and affect GPU memory usage, sequence length, quantization, and inference behavior.
+Models are deployed as `Model` custom resources in the `greenthread-system` namespace. The Model CRD controls every aspect of how your model is served — from GPU memory allocation and tensor parallelism to sleep behavior, fairness policy, and LoRA adapter support.
 
-## Full schema
+## Full spec
 
-```json
-{
-  "vllm_config": {
-    "gpu_memory_utilization": 0.9,
-    "max_model_len": 8192,
-    "quantization": "",
-    "enable_lora": false,
-    "max_lora_rank": 64,
-    "enforce_eager": false,
-    "max_num_seqs": null,
-    "load_format": "auto",
-    "chat_template": "",
-    "extra_args": []
-  }
-}
+```yaml
+apiVersion: greenthread.ai/v1alpha1
+kind: Model
+metadata:
+  name: llama-3-1-8b
+  namespace: greenthread-system
+spec:
+  modelName: meta-llama/Llama-3.1-8B-Instruct
+  dtype: bfloat16
+  gpuMemoryUtilization: "0.90"
+  tensorParallelSize: 1
+  replicas: 1
+  quantization: ""
+  extraArgs:
+    - "--enforce-eager"
+  sleep:
+    idleTimeout: 5m
+    drainTimeout: 30s
+  fairness:
+    minRuntime: 10s
+    maxWaitTime: 5s
+    popular: false
+  staging:
+    pinned: false
+  lora:
+    enabled: false
+    maxRank: 64
+    cacheDir: ""
+    downloadTimeout: 5m
+  kvCache:
+    enabled: false
+    maxSize: ""
+  resources: {}
 ```
 
-## Basic options
+## Core fields
 
-### GPU memory utilization
+### `modelName`
 
-```json
-"gpu_memory_utilization": 0.9
+```yaml
+modelName: meta-llama/Llama-3.1-8B-Instruct
 ```
 
-Fraction of GPU memory the inference engine is allowed to use. Range: `0.1` to `1.0`. Default: `0.9`.
+The HuggingFace model identifier. GreenThread downloads the model, converts it to the `gthread` load format, and stores it on NVMe. This field is **required**.
 
-Lower values leave more room for other models on the same GPU (multi-tenant mode). Higher values allow larger KV caches and longer sequences.
+### `dtype`
+
+```yaml
+dtype: bfloat16
+```
+
+Data type for model weights. Affects VRAM usage and inference precision.
+
+| Value | Description |
+|-------|-------------|
+| `bfloat16` | Default. Good balance of precision and memory usage. |
+| `float16` | Standard half precision. |
+| `float32` | Full precision. Double the VRAM of bf16/fp16. |
+
+### `gpuMemoryUtilization`
+
+```yaml
+gpuMemoryUtilization: "0.90"
+```
+
+Fraction of GPU memory vLLM is allowed to use. Range: `(0, 1]`. Stored as a string to preserve decimal precision.
 
 | Value | Use case |
 |-------|----------|
-| `0.5 – 0.7` | Multi-tenant, multiple small models per GPU |
-| `0.85 – 0.95` | Single model, maximize throughput |
+| `"0.50"` – `"0.70"` | Multi-tenant — multiple models per GPU |
+| `"0.85"` – `"0.95"` | Single model — maximize KV cache and throughput |
 
-### Max model length
+Lower values leave room for other models to share the same GPU via sleep/wake scheduling.
 
-```json
-"max_model_len": 8192
+### `tensorParallelSize`
+
+```yaml
+tensorParallelSize: 2
 ```
 
-Maximum sequence length (prompt + completion tokens). If not set, the engine uses the model's default context length.
+Number of GPUs to shard the model across using tensor parallelism. Must be a power of 2.
 
-Reducing this value decreases KV cache memory usage, allowing the model to fit on smaller GPUs or alongside other models.
+| Size | Use case |
+|------|----------|
+| `1` | Models up to ~80GB VRAM (e.g. 8B, 20B models) |
+| `2` | Models 70B+ in bf16 |
+| `4` | Very large models (100B+) |
+| `8` | Maximum sharding for the largest models |
 
-### Quantization
+Each replica uses `tensorParallelSize` GPUs. The scheduler assigns contiguous GPU indices on the same node.
 
-```json
-"quantization": "awq"
+### `replicas`
+
+```yaml
+replicas: 1
 ```
 
-Weight quantization method. Must match how the model was quantized. Supported values:
+Number of serving pods to create. Each replica independently claims GPUs and handles requests.
+
+### `quantization`
+
+```yaml
+quantization: mxfp4
+```
+
+Quantization method applied during model conversion. Must be compatible with the model weights.
 
 | Method | Description |
 |--------|-------------|
+| `mxfp4` | Microscaling FP4 quantization |
 | `awq` | Activation-aware weight quantization |
 | `gptq` | Post-training quantization |
-| `fp8` | FP8 quantization |
-| `marlin` | Marlin kernel quantization |
-| `squeezellm` | SqueezeLLM quantization |
+| *(empty)* | No quantization — full precision weights |
 
-Leave empty for full-precision models.
+### `extraArgs`
 
-## LoRA settings
-
-### Enable LoRA
-
-```json
-"enable_lora": true
+```yaml
+extraArgs:
+  - "--enforce-eager"
+  - "--max-model-len"
+  - "8192"
+  - "--max-num-seqs"
+  - "128"
 ```
 
-Enables LoRA adapter support for this model. See [LoRA Adapters](/lora-adapters) for usage details.
-
-### Max LoRA rank
-
-```json
-"max_lora_rank": 64
-```
-
-Maximum LoRA rank supported. Range: `1` to `512`. Default: `64`. Must be ≥ the rank of any adapter you plan to serve.
-
-## Advanced options
-
-### Enforce eager mode
-
-```json
-"enforce_eager": true
-```
-
-Disables graph optimization. Useful for debugging or when graph compilation causes issues. Increases memory efficiency at the cost of some throughput.
-
-### Max concurrent sequences
-
-```json
-"max_num_seqs": 256
-```
-
-Maximum number of sequences that can be processed concurrently. Limits batching to control memory usage and latency.
-
-### Load format
-
-```json
-"load_format": "auto"
-```
-
-How model weights are loaded. Values: `auto`, `pt`, `safetensors`, `gthread`.
-
-The `gthread` format enables the fast sleep/wake cycle using the custom model loader. This is set automatically when sleep/wake is available.
-
-### Chat template
-
-```json
-"chat_template": "/path/to/template.jinja2"
-```
-
-Custom Jinja2 chat template. Can be a file path or inline template string. Overrides the model's default chat template.
-
-### Extra args
-
-```json
-"extra_args": ["--disable-log-stats", "--max-log-len", "100"]
-```
-
-Raw CLI arguments passed directly to the inference engine. Use this as an escape hatch for engine options not covered by the schema.
+Raw CLI arguments passed directly to the vLLM inference engine. Each argument is a separate list item.
 
 <Callout type="warning" title="Use with care">
-Extra args bypass validation. Invalid arguments will cause the inference process to fail on startup.
+Extra args bypass validation. Invalid arguments will cause the vLLM process to fail on startup. Check vLLM documentation for supported flags.
 </Callout>
 
-## Tensor parallelism
+Common `extraArgs`:
 
-Tensor parallelism is set at the model level (not inside `vllm_config`):
+| Argument | Description |
+|----------|-------------|
+| `--enforce-eager` | Disable CUDA graphs. Recommended for sleep/wake compatibility. |
+| `--trust-remote-code` | Allow custom model code from HuggingFace. Required for some architectures. |
+| `--max-model-len <n>` | Override the maximum sequence length. Reduces VRAM usage. |
+| `--max-num-seqs <n>` | Maximum concurrent sequences. Lower values reduce VRAM. |
+| `--reasoning-parser <name>` | Enable reasoning/thinking token parsing (e.g. `qwen3`, `deepseek`). |
+| `--enable-auto-tool-choice` | Enable automatic tool/function calling. |
+| `--tool-call-parser <name>` | Tool call parser (e.g. `qwen3_coder`, `hermes`). |
 
-```json
-{
-  "backend_name": "llama-70b",
-  "model_name": "meta-llama/Llama-3.1-70B-Instruct",
-  "tensor_parallel_size": 4,
-  "pinned_gpu_indices": [0, 1, 2, 3]
-}
+## Sleep spec
+
+Controls when and how models go to sleep. See [Lifecycle & States](/model-states) for details on sleep/wake transitions.
+
+```yaml
+sleep:
+  idleTimeout: 5m
+  drainTimeout: 30s
 ```
 
-| `tensor_parallel_size` | Use case |
-|-----------------------|----------|
-| `1` | Models ≤ 13B on a single GPU |
-| `2` | Models 13B–34B across 2 GPUs |
-| `4` | Models 34B–70B across 4 GPUs |
-| `8` | Models > 70B across 8 GPUs |
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `idleTimeout` | duration | `5m` | Duration with no requests before the model voluntarily sleeps |
+| `drainTimeout` | duration | `30s` | Maximum time to wait for in-flight requests to complete during sleep |
 
-If `pinned_gpu_indices` is provided, it must contain exactly `tensor_parallel_size` unique indices. Otherwise, GPUs are allocated automatically.
+When a model sleeps, GreenThread releases **all** VRAM, making the GPU available for other models.
 
-## Validation rules
+## Fairness spec
 
-The following rules are enforced when adding or updating a model:
+Controls preemption behavior when multiple models compete for GPU memory. See [GPU Scheduling](/fairness-policy) for the full algorithm.
 
-- `gpu_memory_utilization`: must be between 0.1 and 1.0
-- `quantization`: must be one of the supported methods or empty
-- `max_lora_rank`: must be between 1 and 512
-- `tensor_parallel_size`: must be 1, 2, 4, or 8
-- `pinned_gpu_indices`: count must match `tensor_parallel_size`, no duplicates
-- `extra_args`: each element must be a non-empty string
+```yaml
+fairness:
+  minRuntime: 10s
+  maxWaitTime: 5s
+  popular: false
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `minRuntime` | duration | `10s` | Minimum time a model must serve before it can be preempted |
+| `maxWaitTime` | duration | `5s` | How long a waiting model waits before it can preempt others |
+| `popular` | bool | `false` | If `true`, the model is never preempted — stays on GPU permanently |
+
+## Staging spec
+
+Controls how model weights are staged in CPU memory for fast wake. See [Storage & Pinning](/storage-pinning) for details.
+
+```yaml
+staging:
+  pinned: false
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `pinned` | bool | `false` | If `true`, keep model weights in CPU pinned RAM after wake for ~600ms wake times. If `false`, weights are evicted to disk after GPU load (~2s with GDS, longer without). |
+
+## LoRA spec
+
+Configures LoRA adapter support. See [LoRA Adapters](/lora-adapters) for the integration pattern.
+
+```yaml
+lora:
+  enabled: true
+  maxRank: 64
+  cacheDir: /tmp/lora-cache
+  downloadTimeout: 5m
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | bool | `false` | Enable LoRA adapter loading |
+| `maxRank` | int | `64` | Maximum LoRA rank supported (must be >= rank of any adapter you serve) |
+| `cacheDir` | string | `""` | Local path for downloaded LoRA adapter files |
+| `downloadTimeout` | duration | `5m` | Maximum time to wait for adapter download from object storage |
+
+### KV cache spec
+
+Configures KV cache persistence via LMCache.
+
+```yaml
+kvCache:
+  enabled: true
+  maxSize: "10Gi"
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | bool | `false` | Enable KV cache persistence |
+| `maxSize` | string | `""` | Maximum KV cache size per replica (e.g. `"10Gi"`) |
+
+<Callout type="info" title="LMCache">
+KV cache persistence requires `lmcache.enabled=true` in the Helm chart values, which deploys a Redis instance for cache storage.
+</Callout>
+
+## Pod placement
+
+### Node selector
+
+```yaml
+nodeSelector:
+  nvidia.com/gpu.present: "true"
+  topology.kubernetes.io/zone: "us-west-2a"
+```
+
+Standard Kubernetes node selector to constrain which nodes the model pod can run on.
+
+### Tolerations
+
+```yaml
+tolerations:
+  - key: nvidia.com/gpu
+    operator: Exists
+    effect: NoSchedule
+```
+
+Standard Kubernetes tolerations for GPU node taints.
+
+### Service account
+
+```yaml
+serviceAccountName: my-model-sa
+```
+
+Kubernetes ServiceAccount for the model pod. Used for IRSA/workload identity when LoRA adapters need to download from object storage (e.g. S3).
+
+## Image overrides
+
+```yaml
+sidecarImage: registry.example.com/greenthread-sidecar:v1.2.0
+vllmImage: registry.example.com/vllm:v0.8.0
+```
+
+Override the default sidecar or vLLM container images. If empty, the controller uses its built-in defaults.
+
+## Resource overrides
+
+```yaml
+resources:
+  requests:
+    cpu: "4"
+    memory: "32Gi"
+  limits:
+    cpu: "8"
+    memory: "64Gi"
+```
+
+Standard Kubernetes resource requirements for the vLLM container.
+
+## Status fields
+
+The controller and sidecar populate these status fields. They are read-only.
+
+```bash
+kubectl get model llama-3-1-8b -n greenthread-system -o yaml
+```
+
+| Field | Description |
+|-------|-------------|
+| `status.phase` | Current lifecycle phase: `Pending`, `Converting`, `Staging`, `Ready`, `Failed` |
+| `status.url` | Full inference endpoint URL (e.g. `http://<gateway>/llama-3-1-8b/v1`) |
+| `status.servingMemoryPerGPU` | Measured VRAM per GPU in bytes (set by sidecar on first boot) |
+| `status.memory.servingHuman` | Human-readable serving VRAM (e.g. `"88.4 GiB"`) |
+| `status.replicas` | Total pod replicas |
+| `status.readyReplicas` | Pods that have completed boot |
+| `status.servingReplicas` | Pods actively serving requests |
+| `status.sleepingReplicas` | Pods in sleep state |
+| `status.node` | Node where the model pod is running |
+| `status.gpus` | Comma-separated GPU indices (e.g. `"0,1"`) |
+| `status.conversion.status` | Conversion state: `Pending`, `Running`, `Complete`, `Failed` |
+| `status.conversion.totalSizeBytes` | Total size of converted model |
+| `status.distribution.availableOnNodes` | Nodes where the model is available |
+| `status.distribution.stagingTier` | Per-node staging tier (`system` or `disk`) |
+
+### kubectl output
+
+```bash
+kubectl get model -A
+```
+
+```
+NAMESPACE            NAME                       PHASE   REPLICAS   SERVING   SLEEPING   NODE        GPUS   VRAM/GPU     URL
+greenthread-system   llama-3-1-8b               Ready   1          0         1          gpu-node1   0      17.2 GiB     http://<gateway>/llama-3-1-8b/v1
+greenthread-system   qwen-3-5-35b-a3b           Ready   1          1         0          gpu-node1   1      88.2 GiB     http://<gateway>/qwen-3-5-35b-a3b/v1
+```

@@ -1,72 +1,190 @@
 import { Callout } from '../components/callout'
+import { Mermaid } from '../components/mermaid'
 
-When multiple models compete for limited GPU memory, GreenThread uses a fairness policy to prevent starvation. The policy ensures that no model waits indefinitely for GPU access while another model monopolizes resources.
+When multiple models compete for limited GPU memory, GreenThread uses a fairness-based preemption algorithm to decide which model sleeps and which wakes. The policy ensures that no model waits indefinitely while another monopolizes GPU resources.
 
 ## How preemption works
 
-A background monitor runs every `fairness_check_period` (default: 1 second) and checks for starving models:
+When a sleeping model receives an inference request and there isn't enough GPU memory available:
 
-1. **Detect starvation**: Find models in `pending` state that have waited longer than `fairness_max_wait_time` (default: 5s).
-2. **Check fit**: If the pending model fits alongside current occupants (memory-aware bin packing), no preemption is needed — the orchestrator will wake it normally.
-3. **Select victim**: Find a `serving` model on the same GPUs that has run longer than `fairness_min_runtime` (default: 10s).
-4. **Preempt**: Transition the victim to `deactivating` → drain in-flight requests → `sleeping`.
-5. **Wake**: The pending model is woken into the freed GPU memory.
+<Mermaid chart={`
+sequenceDiagram
+    participant R as Request
+    participant S as Waking Sidecar
+    participant G as GPU CRDs
+    participant V as Victim Sidecar
 
-## Configuration parameters
+    R->>S: Inference request (model sleeping)
+    S->>G: Check if model fits
+    G-->>S: Not enough memory
+    S->>G: Add PreemptionIntent
+    Note over S: Wait fairness period<br/>(maxWaitTime)
+    S->>G: Re-check fit
+    G-->>S: Still doesn't fit
+    S->>S: Select LRU non-popular victim
+    S->>G: Signal victim via PreemptionIntent
+    V->>G: Detect preemption intent
+    V->>V: Drain requests + release GPU
+    V->>G: Release memory (occupant → sleeping)
+    S->>G: Claim memory + acquire wake lock
+    S->>S: Load weights + wake vLLM
+    S-->>R: Response
+`} />
 
-All fairness parameters are configurable at runtime:
+1. **Check fit**: The waking sidecar reads GPU CRDs to see if the model fits alongside current occupants.
+2. **Add preemption intent**: If it doesn't fit, the sidecar writes a `PreemptionIntent` to the GPU CRDs, signaling its need for memory.
+3. **Fairness wait**: The sidecar waits for `maxWaitTime`, re-checking fit every second. Another model might voluntarily sleep during this window (e.g. idle timeout), avoiding forced preemption.
+4. **Select victim**: After the fairness period, the sidecar selects the best preemption candidate.
+5. **Signal and wait**: The victim's preemption watcher detects the intent and initiates sleep. The waking sidecar polls until the victim releases memory.
+6. **Wake**: Once memory is available, the waking sidecar claims it and loads the model.
 
-| Parameter | Default | Range | Description |
-|-----------|---------|-------|-------------|
-| `fairness_min_runtime` | 10s | 1s – 10min | Minimum time a model must serve before it can be preempted |
-| `fairness_max_wait_time` | 5s | 1s – 5min | How long a pending model waits before triggering preemption |
-| `fairness_check_period` | 1s | 100ms – 10s | How often the monitor scans for starvation |
-| `fairness_drain_timeout` | 30s | 5s – 10min | Max wait for in-flight requests to complete during preemption |
+## Configuration
+
+Fairness is configured per-model in the Model CRD:
+
+```yaml
+apiVersion: greenthread.ai/v1alpha1
+kind: Model
+metadata:
+  name: llama-3-1-8b
+  namespace: greenthread-system
+spec:
+  modelName: meta-llama/Llama-3.1-8B-Instruct
+  fairness:
+    minRuntime: 10s
+    maxWaitTime: 5s
+    popular: false
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `minRuntime` | duration | `10s` | Minimum time a model must serve before it can be preempted. Prevents rapid sleep/wake thrashing. |
+| `maxWaitTime` | duration | `5s` | How long a waiting model waits before forcing preemption. During this window, voluntary sleeps may free memory without forced eviction. |
+| `popular` | bool | `false` | If `true`, the model is **never** preempted. It stays on GPU permanently until manually scaled down. |
+
+## Victim selection algorithm
+
+When preemption is required, the algorithm follows this priority:
+
+1. **Skip popular models** — models with `fairness.popular: true` are never evicted.
+2. **Skip recently woken models** — models that have been serving for less than their `minRuntime` are skipped, preventing thrashing.
+3. **Skip non-serving models** — only `serving` occupants are candidates (sleeping models already have 0 VRAM).
+4. **LRU ordering** — among eligible candidates, the model with the oldest `lastAccessed` timestamp is evicted first.
+5. **Same-GPU constraint** — only models on the same GPU(s) that the waking model needs are considered.
+
+```
+candidates = GPU occupants
+  → filter: state == serving
+  → filter: not popular
+  → filter: serving for >= minRuntime
+  → filter: not self
+  → sort: oldest lastAccessed first (LRU)
+  → evict first candidate
+```
+
+If no eligible candidates exist (e.g. all occupants are popular or recently woken), the wake fails with an error.
 
 ## Popular model protection
 
-Models marked as `popular` are protected from fairness preemption. The scheduler selects non-popular models first when choosing preemption victims.
+Mark a model as popular to prevent it from ever being preempted:
 
-If a popular model is preempted (e.g., by explicit API sleep), GreenThread tracks this and attempts auto-restoration:
-
-- When the preempting model's queue empties, the platform checks if the displaced popular model can be restored.
-- A background monitor periodically scans for preempted popular models that can be restored.
-- GPU memory availability is verified before attempting restoration.
-
-Mark a model as popular:
-
-```bash
-curl -X POST https://your-host:8000/api/models/set_popular \
-  -H "Content-Type: application/json" \
-  -d '{"backend_name": "llama-3-8b", "popular": true}'
+```yaml
+spec:
+  fairness:
+    popular: true
 ```
 
-## Memory-aware scheduling
+Popular models stay on GPU permanently. Use this for your most critical, always-hot models.
 
-Preemption decisions account for actual GPU memory usage:
-
-- The scheduler estimates per-GPU serving memory for each model.
-- Before preempting, it checks whether the pending model fits alongside remaining occupants.
-- If multiple models share a GPU (multi-tenant bin packing), only the minimum number of models are preempted.
+<Callout type="warning" title="Capacity planning">
+If all GPUs are occupied by popular models, no other model can wake. Ensure you leave enough GPU capacity for non-popular models to be scheduled.
+</Callout>
 
 ## Preemption barrier
 
-GreenThread uses an atomic preemption barrier to safely swap models without dropping requests:
+The preemption barrier ensures graceful request handling during model eviction:
 
-1. `PreemptionRequested` flag is set — `TryClaimRequest()` immediately starts returning `false` for new requests.
-2. The system waits for `InFlightCount` to reach zero (bounded by `fairness_drain_timeout`).
-3. Once drained, the sleep operation proceeds.
+1. **Barrier activates** — the victim sidecar stops accepting new requests (`503` response).
+2. **Drain in-flight** — waits up to `sleep.drainTimeout` for active requests to complete.
+3. **Release GPU** — once drained, the model releases all VRAM.
+4. **Barrier deactivates** — cleanup after sleep completes.
 
-This ensures that serving requests complete normally while preventing new requests from being accepted on a model about to sleep.
+If the drain timeout expires with requests still in-flight, the sleep proceeds anyway to prevent starvation of the waiting model.
 
-<Callout type="info" title="Grace period">
-Models have a grace period after waking (`BecameServingAt` timestamp). The fairness monitor won't preempt a model that has been serving for less than `fairness_min_runtime`, giving it time to process its queue.
-</Callout>
+## GPU CRD coordination
 
-## Preemption order
+All scheduling decisions are coordinated through GPU custom resources using optimistic concurrency (CAS updates):
 
-When choosing which model to preempt, the scheduler follows this priority:
+```bash
+kubectl get gpu -A
+```
 
-1. Skip popular models.
-2. Among eligible models, prefer those that have been serving the longest (LRU order).
-3. Only preempt models on the same GPUs that the pending model needs.
+```
+NAMESPACE            NAME           NODE          INDEX   PRODUCT                                        AVAILABLE
+greenthread-system   gpu-node1-0    gpu-node1     0       NVIDIA-RTX-PRO-6000-Blackwell-Server-Edition   102641958912
+greenthread-system   gpu-node1-1    gpu-node1     1       NVIDIA-RTX-PRO-6000-Blackwell-Server-Edition   102641958912
+```
+
+Each GPU CRD tracks:
+
+- **Occupants** — which models are loaded (serving or sleeping) with their reserved memory
+- **Available memory** — total memory minus sum of serving occupants' reserved memory
+- **Preemption intents** — which models are waiting for memory on this GPU
+- **Wake lock** — which pod is currently in the process of waking (prevents concurrent wake races)
+
+### Wake locks
+
+Before loading weights, the waking sidecar acquires a wake lock on each target GPU CRD. This prevents two models from simultaneously trying to claim the same memory. The lock is released after the wake completes (or fails).
+
+### CAS conflicts
+
+GPU CRD updates use optimistic concurrency — if another sidecar modified the GPU CRD between read and write, the update fails and retries. This is tracked by the `gthread_sidecar_gpu_cas_conflicts_total` metric.
+
+## Memory-aware scheduling
+
+The scheduler uses measured VRAM rather than theoretical estimates:
+
+1. On first boot, the sidecar measures actual GPU memory consumption via NVML after vLLM loads the model.
+2. This measured value (`status.servingMemoryPerGPU`) is stored on the Model CRD.
+3. All subsequent scheduling decisions use this measured value for accurate bin packing.
+
+This means the first time a model boots, it may need the full GPU. After that, the scheduler knows exactly how much memory it needs and can pack multiple models per GPU.
+
+## Tuning recommendations
+
+### Low-latency models
+
+For models that must always respond quickly:
+
+```yaml
+fairness:
+  popular: true    # Never evicted
+staging:
+  pinned: true     # Fast wake if it somehow sleeps
+```
+
+### Background/batch models
+
+For models used occasionally where latency is less critical:
+
+```yaml
+fairness:
+  minRuntime: 30s    # Serve for at least 30s before eviction
+  maxWaitTime: 10s   # Wait longer before forcing preemption
+sleep:
+  idleTimeout: 2m    # Sleep quickly when idle
+staging:
+  pinned: false      # Don't hold CPU RAM
+```
+
+### Shared GPU environments
+
+When packing multiple models per GPU:
+
+```yaml
+spec:
+  gpuMemoryUtilization: "0.50"  # Leave room for other models
+  fairness:
+    minRuntime: 60s     # Give each model decent serving time
+    maxWaitTime: 15s    # Be patient before preempting
+```

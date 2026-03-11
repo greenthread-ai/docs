@@ -1,0 +1,115 @@
+import { Mermaid } from '../components/mermaid'
+import { Callout } from '../components/callout'
+
+GreenThread manages the full lifecycle of your models — from deployment to GPU scheduling to sleep/wake — so you can focus on building applications, not infrastructure.
+
+## How GreenThread works
+
+<Mermaid chart={`
+flowchart LR
+    subgraph Clients
+        C1["Your Application"]
+    end
+
+    subgraph GreenThread
+        GW["Gateway"]
+        M1["Model A\n(serving)"]
+        M2["Model B\n(sleeping)"]
+        M3["Model C\n(sleeping)"]
+        ST["Weight Storage"]
+    end
+
+    subgraph GPUs
+        G0["GPU 0"]
+        G1["GPU 1"]
+    end
+
+    C1 --> GW
+    GW --> M1
+    GW -.->|wake on request| M2
+    GW -.->|wake on request| M3
+    M1 --> G0
+    ST -.->|fast restore| G0
+    ST -.->|fast restore| G1
+`} />
+
+1. **Deploy models** — declare what you want to run, GreenThread handles the rest
+2. **Automatic GPU scheduling** — models are assigned to GPUs based on available memory
+3. **Sleep/wake** — idle models release all GPU memory. Incoming requests wake them automatically
+4. **Fairness** — when GPUs are full, the least-recently-used model sleeps to make room
+5. **Standard APIs** — OpenAI, Anthropic, and other inference APIs work out of the box
+
+## Deployment options
+
+GreenThread deploys on any environment with NVIDIA GPUs. Pick your platform:
+
+| Platform | Status | Guide |
+|----------|--------|-------|
+| **AWS (EKS)** | Available | [Get started](/k8s-aws-eks) |
+| **Azure (AKS)** | Coming soon | — |
+| **GCP (GKE)** | Coming soon | — |
+| **Bare Metal** | Coming soon | — |
+
+## Supported APIs
+
+Every model deployed on GreenThread exposes standard inference endpoints at its own URL path. Any SDK that works with OpenAI or Anthropic works with GreenThread.
+
+### OpenAI-compatible
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/<model>/v1/chat/completions` | POST | Chat completions (multi-turn, streaming, tool calling) |
+| `/<model>/v1/completions` | POST | Text completions |
+| `/<model>/v1/responses` | POST | OpenAI Responses API |
+| `/<model>/v1/embeddings` | POST | Text embeddings |
+| `/<model>/v1/audio/transcriptions` | POST | Audio transcription (Whisper-compatible) |
+| `/<model>/v1/audio/translations` | POST | Audio translation |
+| `/<model>/v1/models` | GET | List loaded models |
+
+### Anthropic-compatible
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/<model>/v1/messages` | POST | Anthropic Messages API |
+| `/<model>/v1/messages/count_tokens` | POST | Token counting |
+
+### Scoring, reranking, and tokenization
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/<model>/v1/score` | POST | Scoring |
+| `/<model>/v1/rerank` | POST | Reranking |
+| `/<model>/tokenize` | POST | Tokenize text |
+| `/<model>/detokenize` | POST | Detokenize token IDs |
+| `/<model>/classify` | POST | Text classification |
+
+See [API Reference](/inference-api) for full details, request/response examples, and SDK usage.
+
+## Key features
+
+### True zero VRAM sleep
+
+When a model sleeps, GreenThread releases **all** GPU memory — not 90%, not "most of it" — truly zero bytes. This means the GPU is fully available for other models with no wasted memory.
+
+### Sub-second wake
+
+Models wake from sleep in as little as ~600ms from CPU RAM, or ~2 seconds from NVMe with GPU Direct Storage. Clients see slightly higher latency on the first request, but the response format is identical.
+
+### Fair GPU sharing
+
+GreenThread's [fairness policy](/fairness-policy) ensures no model starves for GPU access. Models that have been idle longest are slept first, and popular models can be pinned to GPUs permanently.
+
+### Per-model routing
+
+Each model gets its own URL path (`/<model-name>/v1/...`), so you can point different applications at different models through a single gateway endpoint.
+
+### Monitoring built in
+
+Prometheus metrics, Grafana dashboards, and alerting are available out of the box. See [Monitoring](/k8s-monitoring) for setup.
+
+## Next steps
+
+- [AWS (EKS)](/k8s-aws-eks) — Set up a GPU cluster on AWS
+- [Prerequisites](/k8s-prerequisites) — Platform prerequisites
+- [Install GreenThread](/k8s-deploy) — Install and verify
+- [Deploying Models](/deploying-models) — Deploy your first models
