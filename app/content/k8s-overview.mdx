@@ -1,252 +1,115 @@
 import { Mermaid } from '../components/mermaid'
 import { Callout } from '../components/callout'
 
-GreenThread on Kubernetes runs as a set of custom resources, controllers, and sidecars managed by the GreenThread Operator. Models are declared as `Model` CRDs and the platform handles GPU scheduling, sleep/wake lifecycle, gateway routing, and monitoring automatically.
+GreenThread manages the full lifecycle of your models — from deployment to GPU scheduling to sleep/wake — so you can focus on building applications, not infrastructure.
 
-## Choose your platform
+## How GreenThread works
 
-GreenThread runs on any Kubernetes cluster with NVIDIA GPUs. Pick your cloud provider to set up the cluster and platform-specific infrastructure, then follow the shared prerequisites and deployment steps.
+<Mermaid chart={`
+flowchart LR
+    subgraph Clients
+        C1["Your Application"]
+    end
+
+    subgraph GreenThread
+        GW["Gateway"]
+        M1["Model A\n(serving)"]
+        M2["Model B\n(sleeping)"]
+        M3["Model C\n(sleeping)"]
+        ST["Weight Storage"]
+    end
+
+    subgraph GPUs
+        G0["GPU 0"]
+        G1["GPU 1"]
+    end
+
+    C1 --> GW
+    GW --> M1
+    GW -.->|wake on request| M2
+    GW -.->|wake on request| M3
+    M1 --> G0
+    ST -.->|fast restore| G0
+    ST -.->|fast restore| G1
+`} />
+
+1. **Deploy models** — declare what you want to run, GreenThread handles the rest
+2. **Automatic GPU scheduling** — models are assigned to GPUs based on available memory
+3. **Sleep/wake** — idle models release all GPU memory. Incoming requests wake them automatically
+4. **Fairness** — when GPUs are full, the least-recently-used model sleeps to make room
+5. **Standard APIs** — OpenAI, Anthropic, and other inference APIs work out of the box
+
+## Deployment options
+
+GreenThread deploys on any environment with NVIDIA GPUs. Pick your platform:
 
 | Platform | Status | Guide |
 |----------|--------|-------|
-| **AWS (EKS)** | Available | [Set up EKS](/k8s-aws-eks) |
+| **AWS (EKS)** | Available | [Get started](/k8s-aws-eks) |
 | **Azure (AKS)** | Coming soon | — |
 | **GCP (GKE)** | Coming soon | — |
 | **Bare Metal** | Coming soon | — |
 
-After platform setup, continue with:
+## Supported APIs
 
-1. [Prerequisites](/k8s-prerequisites) — GPU Operator, DRA Driver, Envoy Gateway
-2. [Deploy GreenThread](/k8s-deploy) — Helm install, models, verification
-3. [Monitoring](/k8s-monitoring) — Prometheus, Grafana, dashboards
+Every model deployed on GreenThread exposes standard inference endpoints at its own URL path. Any SDK that works with OpenAI or Anthropic works with GreenThread.
 
-## Architecture
-
-<Mermaid chart={`
-flowchart TB
-    subgraph Internet
-        Client["Client Application"]
-    end
-
-    subgraph K8s["Kubernetes Cluster"]
-        subgraph GW["Gateway Layer"]
-            NLB["Cloud Load Balancer"]
-            Envoy["Envoy Gateway"]
-        end
-
-        subgraph GT["GreenThread Control Plane"]
-            Ctrl["Controller\n(Operator)"]
-            API["API Server\n(Web UI)"]
-        end
-
-        subgraph Node["GPU Node"]
-            subgraph Pod1["Model Pod (e.g. llama-3-8b)"]
-                SC1["Sidecar\n(wake/sleep proxy)"]
-                VLLM1["vLLM\n(inference engine)"]
-            end
-            subgraph Pod2["Model Pod (e.g. qwen-3-4b)"]
-                SC2["Sidecar"]
-                VLLM2["vLLM"]
-            end
-            Storage["Storage Agent\n(DaemonSet)"]
-            NVMe["/mnt/models\nNVMe SSD"]
-            GPU0["GPU 0"]
-            GPU1["GPU 1"]
-        end
-
-        subgraph Mon["Monitoring"]
-            Prom["Prometheus"]
-            Graf["Grafana"]
-        end
-    end
-
-    Client --> NLB --> Envoy
-    Envoy -->|"/<model>/v1/*"| SC1
-    Envoy -->|"/<model>/v1/*"| SC2
-    SC1 --> VLLM1
-    SC2 --> VLLM2
-    VLLM1 --> GPU0
-    VLLM2 --> GPU1
-    Storage --> NVMe
-    Storage -.->|"gRPC: fill/evict"| VLLM1
-    Storage -.->|"gRPC: fill/evict"| VLLM2
-    Ctrl -->|"reconcile"| Pod1
-    Ctrl -->|"reconcile"| Pod2
-    Prom -->|"scrape"| SC1
-    Prom -->|"scrape"| SC2
-`} />
-
-## Components
-
-### Controller (Operator)
-
-The GreenThread controller watches `Model` and `GPU` custom resources and reconciles the desired state:
-
-- Creates conversion Jobs to download models from HuggingFace and convert them to the `gthread` load format on NVMe storage
-- Creates model Pods with the vLLM inference engine and sidecar containers
-- Creates per-model Services and HTTPRoutes for gateway-based routing
-- Manages GPU scheduling, assigning models to GPUs based on available memory
-- Runs as a Deployment with leader election (2 replicas by default)
-
-### Sidecar
-
-Every model Pod contains a sidecar container that sits between the gateway and vLLM. The sidecar manages:
-
-- **Wake-on-request** — If the model is sleeping, the sidecar triggers a wake (GPU memory restore from NVMe) before proxying the request
-- **Sleep lifecycle** — Monitors idle timeout and initiates sleep (GPU memory checkpoint to NVMe) when the queue is empty
-- **Request queuing** — Tracks in-flight requests and applies a barrier during sleep transitions to drain gracefully
-- **Health and readiness probes** — Reports boot status and serving readiness to Kubernetes
-- **Metrics** — Exposes Prometheus metrics for wake/sleep durations, request counts, queue depth, and GPU memory
-
-### Storage Agent
-
-The storage agent runs as a DaemonSet on every GPU node. It provides:
-
-- **gRPC API** for model fill (NVMe to GPU) and evict (GPU to NVMe) operations
-- **Pinned memory pool** (hugepages-backed) for high-throughput DMA transfers to GPU
-- **Peer-to-peer model distribution** — Nodes discover peers via DNS and transfer models over HTTP, so conversion only runs once across the cluster
-- **Model format management** — Stores models in the `gthread` format optimized for fast GPU loading
-
-### API Server
-
-The API server provides the GreenThread web UI and management APIs:
-
-- Web-based dashboard for model, GPU, and node management
-- REST APIs for model CRUD, GPU status, pod inspection, and cluster events
-- Server-Sent Events (SSE) for real-time state updates
-- Authentication via API keys (Bearer tokens)
-
-### Gateway
-
-GreenThread uses the Kubernetes Gateway API with Envoy Gateway as the data plane:
-
-- A single `Gateway` resource is created by the Helm chart
-- The controller creates per-model `HTTPRoute` resources automatically
-- Each model gets a URL path prefix: `/<model-name>/v1/*`
-- The HTTPRoute rewrites the path prefix before forwarding to the model's sidecar Service
-- A cloud load balancer (NLB on AWS) is provisioned automatically via the load balancer controller
-
-## Sidecar endpoints
-
-Each model Pod exposes the following endpoints through its sidecar. In production, these are accessed via the gateway at `http://<gateway>/<model-name>/...`.
-
-### Status and health
+### OpenAI-compatible
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/health` | GET | Liveness probe. Returns `503` during boot, `200` once ready. |
-| `/ready` | GET | Readiness probe. Returns `200` only when the model is actively serving. |
-| `/status` | GET | Model status JSON: state, boot readiness, queue depth, barrier status. |
-| `/v1/models` | GET | Lists loaded models (works even when sleeping). |
+| `/<model>/v1/chat/completions` | POST | Chat completions (multi-turn, streaming, tool calling) |
+| `/<model>/v1/completions` | POST | Text completions |
+| `/<model>/v1/responses` | POST | OpenAI Responses API |
+| `/<model>/v1/embeddings` | POST | Text embeddings |
+| `/<model>/v1/audio/transcriptions` | POST | Audio transcription (Whisper-compatible) |
+| `/<model>/v1/audio/translations` | POST | Audio translation |
+| `/<model>/v1/models` | GET | List loaded models |
 
-### Inference (OpenAI-compatible)
-
-All inference endpoints trigger wake-on-request if the model is sleeping. Requests are queued during wake transitions and rejected with `503` during sleep drain.
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/v1/chat/completions` | POST | Chat completions (multi-turn conversations, streaming) |
-| `/v1/completions` | POST | Text completions |
-| `/v1/responses` | POST | OpenAI Responses API |
-| `/v1/embeddings` | POST | Text embeddings |
-| `/v1/audio/transcriptions` | POST | Audio transcription (Whisper-compatible) |
-| `/v1/audio/translations` | POST | Audio translation |
-
-### Inference (Anthropic-compatible)
+### Anthropic-compatible
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/v1/messages` | POST | Anthropic Messages API |
-| `/v1/messages/count_tokens` | POST | Token counting |
+| `/<model>/v1/messages` | POST | Anthropic Messages API |
+| `/<model>/v1/messages/count_tokens` | POST | Token counting |
 
-### Scoring and reranking
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/v1/score` | POST | Scoring |
-| `/v1/rerank` | POST | Reranking (v1) |
-| `/v2/rerank` | POST | Reranking (v2) |
-| `/score` | POST | Scoring (root-level alias) |
-| `/rerank` | POST | Reranking (root-level alias) |
-
-### Tokenization and classification
+### Scoring, reranking, and tokenization
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/tokenize` | POST | Tokenize text |
-| `/detokenize` | POST | Detokenize token IDs |
-| `/classify` | POST | Text classification |
+| `/<model>/v1/score` | POST | Scoring |
+| `/<model>/v1/rerank` | POST | Reranking |
+| `/<model>/tokenize` | POST | Tokenize text |
+| `/<model>/detokenize` | POST | Detokenize token IDs |
+| `/<model>/classify` | POST | Text classification |
 
-### Other
+See [API Reference](/inference-api) for full details, request/response examples, and SDK usage.
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/invocations` | POST | SageMaker-compatible inference endpoint |
+## Key features
 
-## Custom resources
+### True zero VRAM sleep
 
-### Model CRD
+When a model sleeps, GreenThread releases **all** GPU memory — not 90%, not "most of it" — truly zero bytes. This means the GPU is fully available for other models with no wasted memory.
 
-The `Model` custom resource defines a model to serve. Key fields:
+### Sub-second wake
 
-```yaml
-apiVersion: greenthread.ai/v1alpha1
-kind: Model
-metadata:
-  name: my-model
-  namespace: greenthread-system
-spec:
-  modelName: meta-llama/Llama-3.1-8B-Instruct  # HuggingFace model ID
-  tensorParallelSize: 1                          # GPUs per replica (power of 2)
-  replicas: 1                                    # Number of serving pods
-  dtype: bfloat16                                # Weight data type
-  quantization: ""                               # Optional: mxfp4, awq, gptq
-  gpuMemoryUtilization: "0.90"                   # Fraction of GPU VRAM for vLLM
-  extraArgs:                                     # Additional vLLM CLI arguments
-    - "--enforce-eager"
-  sleep:
-    idleTimeout: 5m                              # Sleep after 5 minutes idle
-    drainTimeout: 30s                            # Max drain wait before force sleep
-  fairness:
-    minRuntime: 30s                              # Minimum serve time before preemption
-    popular: false                               # If true, never preempted
-  staging:
-    pinned: false                                # Keep in CPU cache when staged
-  lora:
-    enabled: false                               # Enable LoRA adapter loading
-  kvCache:
-    enabled: false                               # Enable KV cache persistence
-```
+Models wake from sleep in as little as ~600ms from CPU RAM, or ~2 seconds from NVMe with GPU Direct Storage. Clients see slightly higher latency on the first request, but the response format is identical.
 
-### GPU CRD
+### Fair GPU sharing
 
-The `GPU` custom resource tracks per-GPU state. Created automatically by the controller when GPU nodes join:
+GreenThread's [fairness policy](/fairness-policy) ensures no model starves for GPU access. Models that have been idle longest are slept first, and popular models can be pinned to GPUs permanently.
 
-```bash
-kubectl get gpu -A
-```
+### Per-model routing
 
-```
-NAMESPACE            NAME           NODE          INDEX   PRODUCT                                        AVAILABLE
-greenthread-system   gpu-node1-0    node1         0       NVIDIA-RTX-PRO-6000-Blackwell-Server-Edition   102641958912
-greenthread-system   gpu-node1-1    node1         1       NVIDIA-RTX-PRO-6000-Blackwell-Server-Edition   102641958912
-```
+Each model gets its own URL path (`/<model-name>/v1/...`), so you can point different applications at different models through a single gateway endpoint.
 
-## Request flow
+### Monitoring built in
 
-When a request hits the gateway:
-
-1. **Envoy** matches the path prefix (`/<model>/v1/...`) and routes to the model's Service
-2. The **sidecar** receives the request and checks the model state
-3. If **serving**: the request is proxied directly to vLLM with no overhead
-4. If **sleeping**: the sidecar triggers a wake via the storage agent, waits for GPU memory restore, then proxies the request
-5. If the **GPU is full**: the controller's fairness policy preempts the least-recently-used model to free GPU memory, then the wake proceeds
-6. **vLLM** runs inference and streams the response back through the sidecar
-
-The entire wake-on-request flow is transparent to the client — they see slightly higher latency on the first request but the response format is identical.
+Prometheus metrics, Grafana dashboards, and alerting are available out of the box. See [Monitoring](/k8s-monitoring) for setup.
 
 ## Next steps
 
-Choose your platform to get started:
-
-- [AWS (EKS)](/k8s-aws-eks) — Set up an EKS cluster with GPU nodes
+- [AWS (EKS)](/k8s-aws-eks) — Set up a GPU cluster on AWS
+- [Prerequisites](/k8s-prerequisites) — Platform prerequisites
+- [Install GreenThread](/k8s-deploy) — Install and verify
+- [Deploying Models](/deploying-models) — Deploy your first models
