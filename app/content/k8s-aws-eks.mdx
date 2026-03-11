@@ -210,14 +210,22 @@ vpc:
         id: "<subnet-id-d>"
 
 managedNodeGroups:
-  - name: gpu-nvidia-2x-rtx6000pro
+  - name: gpu-nodes
     instanceType: g7e.12xlarge
     ami: <ami-id>
     amiFamily: Ubuntu2404
     minSize: 1
-    maxSize: 1
-    desiredCapacity: 1
-    volumeSize: 200
+    maxSize: 2
+    desiredCapacity: 2
+    volumeSize: 500
+    # Pin all nodes to a single AZ (required for EFA)
+    availabilityZones:
+      - us-west-2a
+    # Enable EFA for high-bandwidth inter-node model transfers
+    efaEnabled: true
+    # Cluster placement group for full EFA bandwidth
+    placement:
+      groupName: <placement-group-name>
     overrideBootstrapCommand: |
       #!/bin/bash
       set -ex
@@ -254,16 +262,78 @@ managedNodeGroups:
 The VPC section is required because `eksctl` cannot auto-discover VPC details from non-eksctl-managed clusters.
 </Callout>
 
+### EFA and multi-node networking
+
+When running multiple GPU nodes, GreenThread's storage servers form a cluster and can transfer model weights between nodes on demand. Enabling EFA (Elastic Fabric Adapter) dramatically accelerates these transfers.
+
+#### Why EFA matters
+
+G7e instances support up to 400 Gbps (g7e.12xlarge) or 1600 Gbps (g7e.48xlarge) of network bandwidth with EFA — compared to ~20 Gbps over standard TCP without it. At 400 Gbps, a 32 GB model transfers between nodes in under a second, which means you don't need to store every model on every node.
+
+EFA also enables **GPUDirect RDMA**, allowing the network adapter to write directly to GPU memory without CPU involvement.
+
+#### Requirements
+
+EFA has three hard requirements:
+
+1. **Single Availability Zone** — EFA traffic cannot cross AZs. All GPU nodes must be in the same AZ, configured via `availabilityZones` in the node group.
+2. **Cluster placement group** — required for full EFA bandwidth. Create one before the node group:
+   ```bash
+   aws ec2 create-placement-group \
+     --group-name <placement-group-name> \
+     --strategy cluster \
+     --region us-west-2
+   ```
+3. **Security group self-referencing rule** — the cluster security group must allow all traffic from itself. EKS clusters typically have this by default. Verify:
+   ```bash
+   aws ec2 describe-security-groups --group-ids <sg-id> \
+     --query "SecurityGroups[0].IpPermissions[?IpProtocol=='-1'].UserIdGroupPairs[].GroupId" \
+     --output text --region us-west-2
+   # Should include the security group's own ID
+   ```
+
+#### Install the EFA device plugin
+
+After the node group is created, install the EFA Kubernetes device plugin. This exposes EFA interfaces as schedulable resources (`vpc.amazonaws.com/efa`):
+
+```bash
+helm repo add eks https://aws.github.io/eks-charts
+helm repo update
+
+helm install aws-efa-k8s-device-plugin \
+  --namespace kube-system \
+  eks/aws-efa-k8s-device-plugin \
+  --set "supportedInstanceLabels.keys={node.kubernetes.io/instance-type}" \
+  --set "supportedInstanceLabels.values={g7e.12xlarge,g7e.24xlarge,g7e.48xlarge}"
+```
+
+<Callout type="warning" title="Instance type allowlist">
+The EFA device plugin chart ships with a hardcoded list of supported instance types that may not include newer instances like g7e. The `supportedInstanceLabels` override above ensures the plugin schedules on g7e nodes. Adjust the values list to match your instance types.
+</Callout>
+
+Verify EFA is detected on the nodes:
+
+```bash
+kubectl get nodes -o json | \
+  jq '.items[] | {name: .metadata.name, efa: .status.capacity["vpc.amazonaws.com/efa"]}'
+```
+
+Each EFA-enabled node should show `"efa": "1"` (or more, depending on instance size).
+
+<Callout type="tip" title="Single-node deployments">
+EFA is only needed for multi-node clusters. If you're running a single GPU node, you can omit `efaEnabled`, `placement`, and `availabilityZones` from the node group config.
+</Callout>
+
 ### Instance type reference
 
-| Instance Type | GPUs | GPU Model | GPU Memory | NVMe Storage | vCPUs | RAM |
-|---|---|---|---|---|---|---|
-| `g7e.2xlarge` | 1 | RTX PRO 6000 Blackwell | 96 GB | 1.9 TB | 8 | 64 GiB |
-| `g7e.4xlarge` | 1 | RTX PRO 6000 Blackwell | 96 GB | 1.9 TB | 16 | 128 GiB |
-| `g7e.8xlarge` | 1 | RTX PRO 6000 Blackwell | 96 GB | 1.9 TB | 32 | 256 GiB |
-| `g7e.12xlarge` | 2 | RTX PRO 6000 Blackwell | 192 GB | 3.8 TB | 48 | 512 GiB |
-| `g7e.24xlarge` | 4 | RTX PRO 6000 Blackwell | 384 GB | 7.6 TB | 96 | 1024 GiB |
-| `g7e.48xlarge` | 8 | RTX PRO 6000 Blackwell | 768 GB | 15.2 TB | 192 | 2048 GiB |
+| Instance Type | GPUs | GPU Model | GPU Memory | NVMe Storage | vCPUs | RAM | Network | EFA |
+|---|---|---|---|---|---|---|---|---|
+| `g7e.2xlarge` | 1 | RTX PRO 6000 Blackwell | 96 GB | 1.9 TB | 8 | 64 GiB | 50 Gbps | No |
+| `g7e.4xlarge` | 1 | RTX PRO 6000 Blackwell | 96 GB | 1.9 TB | 16 | 128 GiB | 100 Gbps | No |
+| `g7e.8xlarge` | 1 | RTX PRO 6000 Blackwell | 96 GB | 1.9 TB | 32 | 256 GiB | 200 Gbps | No |
+| `g7e.12xlarge` | 2 | RTX PRO 6000 Blackwell | 192 GB | 3.8 TB | 48 | 512 GiB | 400 Gbps | Yes |
+| `g7e.24xlarge` | 4 | RTX PRO 6000 Blackwell | 384 GB | 7.6 TB | 96 | 1024 GiB | 800 Gbps | Yes |
+| `g7e.48xlarge` | 8 | RTX PRO 6000 Blackwell | 768 GB | 15.2 TB | 192 | 2048 GiB | 1600 Gbps | Yes |
 
 ### Create the node group
 
@@ -279,7 +349,7 @@ The node role needs permissions for EC2 operations and ELB management:
 # Find the node role
 aws eks describe-nodegroup \
   --cluster-name <cluster-name> \
-  --nodegroup-name gpu-nvidia-2x-rtx6000pro \
+  --nodegroup-name gpu-nodes \
   --region us-west-2 \
   --query "nodegroup.nodeRole" --output text
 
@@ -297,7 +367,7 @@ aws iam attach-role-policy \
 For production environments, use the [scoped IAM policy](https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/main/docs/install/iam_policy.json) from the AWS Load Balancer Controller documentation instead of `FullAccess` policies.
 </Callout>
 
-### Verify the node
+### Verify the nodes
 
 ```bash
 kubectl get nodes -o wide
@@ -307,6 +377,17 @@ kubectl describe node <gpu-node-name> | grep -i hugepages
 
 # Expected output:
 #   hugepages-2Mi: 8Gi   (in both Capacity and Allocatable)
+```
+
+If EFA is enabled, also verify:
+
+```bash
+# Check EFA resources are advertised
+kubectl get nodes -o json | \
+  jq '.items[] | select(.status.capacity["vpc.amazonaws.com/efa"]) | {name: .metadata.name, efa: .status.capacity["vpc.amazonaws.com/efa"]}'
+
+# Check all nodes are in the same AZ
+kubectl get nodes -L topology.kubernetes.io/zone
 ```
 
 ## Install the AWS Load Balancer Controller
