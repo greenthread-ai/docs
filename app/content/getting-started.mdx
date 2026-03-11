@@ -1,13 +1,13 @@
 import { Mermaid } from '../components/mermaid'
 
-GreenThread is a GPU inference platform for Kubernetes that lets you serve dozens of large language models on shared GPUs by intelligently swapping them in and out of GPU memory. Instead of dedicating GPUs to individual models, GreenThread keeps sleeping models checkpoint on NVMe or in CPU memory and wakes them on demand — in under 2 seconds.
+GreenThread is a GPU inference platform that lets you serve dozens of large language models on shared GPUs by intelligently swapping them in and out of GPU memory. Instead of dedicating GPUs to individual models, GreenThread keeps sleeping models on fast storage and wakes them on demand — in under a second.
 
 ## How it works
 
-GreenThread deploys models as Kubernetes custom resources. Each model gets its own pod with a sidecar proxy that manages the sleep/wake lifecycle. When a request arrives:
+When a request arrives for a model:
 
-1. If the model is **serving**, the request is proxied directly to vLLM — no overhead.
-2. If the model is **sleeping**, the sidecar wakes it by restoring weights from CPU cache to GPU, then proxies the request.
+1. If the model is **serving**, the request is forwarded directly — no overhead.
+2. If the model is **sleeping**, GreenThread wakes it by restoring weights to GPU, then forwards the request.
 3. If GPUs are full, the [fairness policy](/fairness-policy) preempts the least-recently-used model to make room.
 
 All of this happens transparently behind OpenAI-compatible, Anthropic-compatible, and other standard inference APIs.
@@ -22,14 +22,9 @@ flowchart LR
         C3["Tool calling request"]
     end
 
-    subgraph Kubernetes
-        GW["Envoy Gateway"]
-        subgraph Model Pods
-            S1["Sidecar → vLLM"]
-            S2["Sidecar → vLLM"]
-            S3["Sidecar → vLLM"]
-        end
-        SA["Storage Agent\nNVMe + CPU cache"]
+    subgraph GreenThread
+        API["Gateway + Router"]
+        STR["Weight Storage\nCPU RAM + NVMe"]
     end
 
     subgraph GPUs
@@ -37,20 +32,16 @@ flowchart LR
         G1["GPU 1"]
     end
 
-    C1 --> GW
-    C2 --> GW
-    C3 --> GW
-    GW --> S1
-    GW --> S2
-    GW --> S3
-    S1 --> G0
-    S2 --> G1
-    S3 --> G0
-    SA -.->|wake| G0
-    SA -.->|wake| G1
+    C1 --> API
+    C2 --> API
+    C3 --> API
+    API --> G0
+    API --> G1
+    STR -.->|wake| G0
+    STR -.->|wake| G1
 `} />
 
-Each model runs in its own pod with a sidecar that handles request queuing, wake-on-request, and sleep lifecycle. When a model sleeps, GreenThread releases **all** GPU memory — true zero VRAM — making the GPU fully available for other models.
+When a model sleeps, GreenThread releases **all** GPU memory — true zero VRAM — making the GPU fully available for other models. No dedicated GPU per model, no idle waste.
 
 ## Performance
 
@@ -59,15 +50,13 @@ For a 20B-parameter model:
 | Operation | Time |
 |-----------|------|
 | Traditional cold start | ~40 seconds |
-| GreenThread wake (from CPU RAM) | ~600ms |
-| GreenThread wake (from NVMe with GDS) | ~2 seconds |
+| GreenThread wake (from RAM) | ~600ms |
+| GreenThread wake (from NVMe) | ~2 seconds |
 | GreenThread sleep | ~90 milliseconds |
-
-The improvement comes from keeping the inference process alive while sleeping and using fast transfer paths — DMA from pinned host memory at ~65 GB/s, or GPU Direct Storage from NVMe at ~20 GB/s.
 
 ## API compatibility
 
-GreenThread exposes inference endpoints through a per-model gateway path. Each model supports the full vLLM API surface:
+GreenThread exposes standard inference APIs per model. Any SDK or tool that works with OpenAI or Anthropic works with GreenThread:
 
 - `POST /<model>/v1/chat/completions` — Chat completions with streaming
 - `POST /<model>/v1/completions` — Text completions
@@ -80,35 +69,13 @@ See [API Reference](/inference-api) for the full endpoint list.
 
 ## Quickstart
 
-Deploy a model:
-
-```yaml
-apiVersion: greenthread.ai/v1alpha1
-kind: Model
-metadata:
-  name: llama-3-8b
-  namespace: greenthread-system
-spec:
-  modelName: meta-llama/Llama-3.1-8B-Instruct
-  dtype: bfloat16
-  gpuMemoryUtilization: "0.90"
-  tensorParallelSize: 1
-  replicas: 1
-  extraArgs:
-    - "--enforce-eager"
-```
-
-```bash
-kubectl apply -f model.yaml
-```
-
-Send a request through the gateway:
+Point your OpenAI SDK at your GreenThread instance:
 
 ```python
 from openai import OpenAI
 
 client = OpenAI(
-    base_url="http://<gateway-url>/llama-3-8b/v1",
+    base_url="http://<greenthread-url>/llama-3-8b/v1",
     api_key="not-needed",
 )
 
@@ -123,8 +90,8 @@ If the model is sleeping, GreenThread automatically wakes it, serves the request
 
 ## Next steps
 
-- [Architecture](/k8s-overview) — Components, request flow, and CRD overview
-- [AWS (EKS)](/k8s-aws-eks) — Set up a GPU cluster on AWS
-- [Install GreenThread](/k8s-deploy) — Helm install and verification
+- [Architecture](/k8s-overview) — How GreenThread works under the hood
+- [Install GreenThread](/k8s-deploy) — Get up and running
 - [Deploying Models](/deploying-models) — Deploy your first models
 - [Inference API](/inference-api) — Full endpoint reference
+- [Cost Calculator](/cost-calculator) — Compare GreenThread vs cloud API costs
