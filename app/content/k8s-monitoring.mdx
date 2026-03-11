@@ -1,0 +1,173 @@
+import { Callout } from '../components/callout'
+
+GreenThread integrates with the kube-prometheus-stack for metrics, dashboards, and alerting. When monitoring is enabled, GreenThread automatically deploys ServiceMonitors, PodMonitors, and Grafana dashboards.
+
+<Callout type="warning" title="Install order">
+The monitoring stack must be installed **before** GreenThread (or before running `helm upgrade` with `monitoring.enabled=true`) so that GreenThread can detect the Prometheus Operator CRDs at install time.
+</Callout>
+
+## Install kube-prometheus-stack
+
+```bash
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+helm repo update
+
+helm install kube-prom prometheus-community/kube-prometheus-stack \
+  --version 82.5.0 \
+  --namespace monitoring \
+  --create-namespace \
+  --set prometheus.prometheusSpec.serviceMonitorSelectorNilUsesHelmValues=false \
+  --set prometheus.prometheusSpec.podMonitorSelectorNilUsesHelmValues=false
+```
+
+<Callout type="warning" title="Cross-namespace scraping">
+The two `NilUsesHelmValues=false` flags are critical. Without them, Prometheus only scrapes ServiceMonitors and PodMonitors that carry the Helm release label, which means it will **not** pick up GreenThread's monitors from the `greenthread-system` namespace.
+</Callout>
+
+### Verify the stack
+
+```bash
+kubectl get pods -n monitoring
+```
+
+All pods should reach `Running` within a few minutes. The stack includes Prometheus, Alertmanager, Grafana, kube-state-metrics, and node-exporter.
+
+## Enable monitoring in GreenThread
+
+If you haven't already enabled monitoring during the initial install, upgrade your GreenThread release:
+
+```bash
+helm upgrade greenthread \
+  oci://licence.greenthread.ai/greenthread/charts/greenthread \
+  --namespace greenthread-system \
+  --reuse-values \
+  --set monitoring.enabled=true
+```
+
+This deploys the following monitoring resources:
+
+| Resource | Type | Description |
+|----------|------|-------------|
+| `greenthread-sidecar` | PodMonitor | Scrapes sidecar metrics from every model pod |
+| `greenthread-controller` | ServiceMonitor | Scrapes controller metrics |
+| `greenthread-apiserver` | ServiceMonitor | Scrapes API server metrics |
+| `greenthread-dcgm` | PodMonitor | Scrapes DCGM GPU metrics |
+| `greenthread-vllm` | PodMonitor | Scrapes vLLM inference engine metrics |
+| GreenThread GPU Dashboard | ConfigMap (Grafana) | GPU utilization, memory, temperature |
+| GreenThread Models Dashboard | ConfigMap (Grafana) | Model lifecycle, wake/sleep times, request rates |
+| GreenThread System Dashboard | ConfigMap (Grafana) | Controller reconciliation, queue depth, errors |
+| GreenThread vLLM Dashboard | ConfigMap (Grafana) | vLLM inference latency, throughput, KV cache |
+
+## Access Grafana
+
+```bash
+kubectl port-forward svc/kube-prom-grafana 3000:80 -n monitoring
+```
+
+Open [http://localhost:3000](http://localhost:3000).
+
+Retrieve the admin password:
+
+```bash
+# Username: admin
+kubectl get secret -n monitoring kube-prom-grafana \
+  -o jsonpath='{.data.admin-password}' | base64 -d; echo
+```
+
+The GreenThread dashboards are automatically provisioned and appear under the **GreenThread** folder in Grafana.
+
+## Sidecar metrics
+
+The sidecar exposes the following Prometheus metrics on each model pod:
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `gthread_sidecar_state` | Gauge | `state` | Current sidecar state (sleeping, pending, waking, serving, deactivating). Exactly one label is 1 at any time. |
+| `gthread_sidecar_queue_depth` | Gauge | — | Current request queue depth |
+| `gthread_sidecar_in_flight_requests` | Gauge | — | Number of in-flight requests being processed |
+| `gthread_sidecar_wake_duration_seconds` | Histogram | — | Time to wake a model from sleeping state |
+| `gthread_sidecar_sleep_duration_seconds` | Histogram | — | Time to sleep a model (drain + checkpoint) |
+| `gthread_sidecar_requests_total` | Counter | `status` | Total requests processed (success/error) |
+| `gthread_sidecar_gpu_memory_reserved_bytes` | Gauge | `gpu` | Reserved GPU memory in bytes per GPU index |
+| `gthread_sidecar_gpu_memory_serving_bytes` | Gauge | `gpu` | Measured serving GPU memory in bytes per GPU index |
+| `gthread_sidecar_preemptions_total` | Counter | `role` | Preemption events (preempted/preempting) |
+| `gthread_sidecar_preemption_barrier_timeouts_total` | Counter | — | Drain timeouts during preemption barrier |
+| `gthread_sidecar_wake_deduplications_total` | Counter | — | Times a wake request was coalesced with an in-flight wake |
+| `gthread_sidecar_gpu_cas_conflicts_total` | Counter | — | Optimistic CAS conflicts on GPU CRDs |
+
+## Example Prometheus queries
+
+### Wake latency (p99)
+
+```promql
+histogram_quantile(0.99, rate(gthread_sidecar_wake_duration_seconds_bucket[5m]))
+```
+
+### Request rate per model
+
+```promql
+sum by (pod) (rate(gthread_sidecar_requests_total{status="success"}[5m]))
+```
+
+### Models currently serving
+
+```promql
+count(gthread_sidecar_state{state="serving"} == 1)
+```
+
+### GPU memory utilization
+
+```promql
+gthread_sidecar_gpu_memory_serving_bytes / on(gpu) gpu_memory_total_bytes
+```
+
+### Queue depth across all models
+
+```promql
+sum(gthread_sidecar_queue_depth)
+```
+
+## Alerting
+
+You can create PrometheusRule resources to alert on GreenThread conditions. Example alerts:
+
+```yaml
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: greenthread-alerts
+  namespace: monitoring
+spec:
+  groups:
+    - name: greenthread
+      rules:
+        - alert: ModelWakeLatencyHigh
+          expr: histogram_quantile(0.99, rate(gthread_sidecar_wake_duration_seconds_bucket[5m])) > 10
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Model wake latency p99 exceeds 10 seconds"
+
+        - alert: ModelStuckWaking
+          expr: gthread_sidecar_state{state="waking"} == 1
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Model stuck in waking state for over 5 minutes"
+
+        - alert: HighPreemptionRate
+          expr: rate(gthread_sidecar_preemptions_total[5m]) > 0.1
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "High preemption rate — consider adding GPU capacity"
+```
+
+## Next steps
+
+- [Metrics & Usage](/metrics-usage) — JSON metrics APIs and usage tracking
+- [Model States & Lifecycle](/model-states) — Understanding model state transitions
+- [Fairness Policy](/fairness-policy) — GPU scheduling and preemption

@@ -1,0 +1,154 @@
+import { Callout } from '../components/callout'
+
+Before deploying GreenThread, your Kubernetes cluster needs three infrastructure components: the NVIDIA GPU Operator (for GPU drivers), the NVIDIA DRA Driver (for GPU allocation), and Envoy Gateway (for request routing). Install each in order and verify before moving on.
+
+## NVIDIA GPU Operator
+
+The GPU Operator installs NVIDIA drivers, the container toolkit, and GPU feature discovery. The legacy device plugin is disabled in favour of DRA.
+
+```bash
+helm repo add nvidia https://helm.ngc.nvidia.com/nvidia
+helm repo update
+
+helm install gpu-operator nvidia/gpu-operator \
+  --version=v25.10.1 \
+  --create-namespace \
+  --namespace gpu-operator \
+  --set devicePlugin.enabled=false \
+  --set driver.enabled=true \
+  --set toolkit.enabled=true
+```
+
+Wait for all pods to reach `Running`:
+
+```bash
+kubectl get pods -n gpu-operator -w
+```
+
+<Callout type="info" title="Driver compilation">
+The NVIDIA driver DaemonSet compiles kernel modules on the node. This process can take 5-10 minutes on first boot.
+</Callout>
+
+## NVIDIA DRA Driver
+
+Dynamic Resource Allocation (DRA) replaces the legacy device plugin model with a flexible, claim-based GPU allocation system. DRA is GA from Kubernetes 1.34+.
+
+### Label the GPU node
+
+```bash
+GPU_NODE=$(kubectl get nodes -l nvidia.com/gpu.present=true -o jsonpath='{.items[0].metadata.name}')
+kubectl label node $GPU_NODE nvidia.com/dra-kubelet-plugin=true
+```
+
+### Install the DRA Driver
+
+Since the GPU Operator installs drivers to `/run/nvidia/driver` (not the root filesystem), the `nvidiaDriverRoot` must be overridden. The controller affinity must also be adjusted for managed Kubernetes services (like EKS) which have no schedulable control plane nodes.
+
+```bash
+helm install nvidia-dra-driver-gpu nvidia/nvidia-dra-driver-gpu \
+  --version="25.12.0" \
+  --create-namespace \
+  --namespace nvidia-dra-driver-gpu \
+  --set resources.gpus.enabled=true \
+  --set gpuResourcesEnabledOverride=true \
+  --set nvidiaDriverRoot=/run/nvidia/driver \
+  --set controller.nodeSelector=null \
+  --set "controller.affinity=null" \
+  --set "controller.tolerations[0].key=CriticalAddonsOnly" \
+  --set "controller.tolerations[0].operator=Exists"
+```
+
+### Verify DRA
+
+```bash
+# Pods running
+kubectl get pods -n nvidia-dra-driver-gpu
+
+# DeviceClasses created
+kubectl get deviceclasses
+# Expected: gpu.nvidia.com, mig.nvidia.com
+
+# ResourceSlices showing GPUs
+kubectl get resourceslices
+```
+
+## Envoy Gateway
+
+GreenThread uses the Kubernetes Gateway API with Envoy Gateway as the data plane. The controller creates per-model HTTPRoutes automatically — you only need to set up the GatewayClass and EnvoyProxy configuration.
+
+### Install Envoy Gateway
+
+```bash
+helm install eg oci://docker.io/envoyproxy/gateway-helm \
+  --version v1.7.0 \
+  -n envoy-gateway-system \
+  --create-namespace
+
+kubectl wait --timeout=5m -n envoy-gateway-system \
+  deployment/envoy-gateway --for=condition=Available
+```
+
+### Create the GatewayClass
+
+GreenThread expects a GatewayClass named `envoy`:
+
+```yaml
+# gatewayclass.yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: envoy
+spec:
+  controllerName: gateway.envoyproxy.io/gatewayclass-controller
+  parametersRef:
+    group: gateway.envoyproxy.io
+    kind: EnvoyProxy
+    name: greenthread-proxy-config
+    namespace: envoy-gateway-system
+```
+
+### Configure the EnvoyProxy resource
+
+This configures the Service annotations so that the cloud load balancer controller provisions a load balancer automatically. The example below is for AWS NLB — adjust annotations for your cloud provider.
+
+```yaml
+# envoyproxy.yaml
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyProxy
+metadata:
+  name: greenthread-proxy-config
+  namespace: envoy-gateway-system
+spec:
+  provider:
+    type: Kubernetes
+    kubernetes:
+      envoyService:
+        annotations:
+          service.beta.kubernetes.io/aws-load-balancer-scheme: internet-facing
+          service.beta.kubernetes.io/aws-load-balancer-type: external
+          service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
+```
+
+Apply both resources:
+
+```bash
+kubectl apply -f gatewayclass.yaml
+kubectl apply -f envoyproxy.yaml
+```
+
+<Callout type="info" title="Gateway resource">
+The Gateway resource itself is created by the GreenThread Helm chart — you do not need to create it manually.
+</Callout>
+
+## Checklist
+
+Before deploying GreenThread, confirm:
+
+- [ ] GPU Operator pods are all `Running` in `gpu-operator` namespace
+- [ ] DRA Driver pods are `Running` and `kubectl get deviceclasses` shows `gpu.nvidia.com`
+- [ ] Envoy Gateway deployment is `Available` in `envoy-gateway-system`
+- [ ] GatewayClass and EnvoyProxy resources are applied
+
+## Next steps
+
+Continue to [Deploy GreenThread](/k8s-deploy) to install the platform via Helm and deploy your first models.

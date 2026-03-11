@@ -1,0 +1,209 @@
+import { Callout } from '../components/callout'
+
+With your cluster and prerequisites in place, install GreenThread via Helm.
+
+## Install GreenThread
+
+### Create the namespace
+
+```bash
+kubectl create namespace greenthread-system
+```
+
+### Log in to the Helm registry
+
+```bash
+helm registry login licence.greenthread.ai \
+  --username user \
+  --password <your-licence-token>
+```
+
+The username can be anything — the password is the licence token provided by sales.
+
+### Install via Helm
+
+```bash
+helm upgrade --install greenthread \
+  oci://licence.greenthread.ai/greenthread/charts/greenthread \
+  --namespace greenthread-system \
+  --create-namespace \
+  --set licenceToken=<your-licence-token> \
+  --set huggingfaceToken=<your-hf-token> \
+  --set monitoring.enabled=true
+```
+
+<Callout type="info" title="Monitoring flag">
+The `monitoring.enabled=true` flag requires the kube-prometheus-stack to be installed first (see [Monitoring](/k8s-monitoring)). When enabled, GreenThread deploys ServiceMonitors, PodMonitors, and Grafana dashboards. If you're not using Prometheus yet, omit this flag and add it later with `helm upgrade`.
+</Callout>
+
+### Retrieve admin credentials
+
+```bash
+# Username
+echo "admin"
+
+# Password
+kubectl get secret greenthread-admin -n greenthread-system \
+  -o jsonpath='{.metadata.annotations.greenthread\.ai/generated-password}'
+```
+
+### Access the web UI
+
+```bash
+kubectl port-forward svc/gthread-apiserver 3001:80 -n greenthread-system
+```
+
+Open [http://localhost:3001](http://localhost:3001) and log in with the admin credentials above.
+
+## Verify GPU detection
+
+GreenThread automatically discovers GPUs on nodes labelled `nvidia.com/gpu.present=true`:
+
+```bash
+kubectl get gpu -A
+```
+
+Expected output:
+
+```
+NAMESPACE            NAME           NODE          INDEX   PRODUCT                                        AVAILABLE
+greenthread-system   gpu-node1-0    <node-name>   0       NVIDIA-RTX-PRO-6000-Blackwell-Server-Edition   102641958912
+greenthread-system   gpu-node1-1    <node-name>   1       NVIDIA-RTX-PRO-6000-Blackwell-Server-Edition   102641958912
+```
+
+## Verify storage
+
+The storage DaemonSet requires hugepages and runs on GPU nodes:
+
+```bash
+kubectl get pods -n greenthread-system -l app=gthread-storage
+```
+
+<Callout type="warning" title="Pending storage pods">
+If the storage pod is stuck in `Pending` with `Insufficient hugepages-2Mi`, hugepages are not configured on the GPU node. See the bootstrap script in your platform setup guide (e.g. [AWS EKS](/k8s-aws-eks)) for hugepages configuration.
+</Callout>
+
+## Next: Deploy models
+
+Once GreenThread is installed and GPUs are detected, you're ready to deploy models. See [Deploying Models](/deploying-models) for a step-by-step guide.
+
+## Full health check
+
+```bash
+# All GreenThread pods healthy
+kubectl get pods -n greenthread-system
+
+# Model status
+kubectl get model -A
+
+# GPU status
+kubectl get gpu -A
+
+# Storage agent health
+kubectl logs -n greenthread-system -l app=gthread-storage --tail=20
+
+# GPU Operator healthy
+kubectl get pods -n gpu-operator
+
+# DRA Driver healthy
+kubectl get pods -n nvidia-dra-driver-gpu
+
+# Envoy Gateway healthy
+kubectl get pods -n envoy-gateway-system
+
+# Load balancer provisioned
+kubectl get svc -A | grep LoadBalancer
+```
+
+## Helm chart values reference
+
+Key configuration options for the GreenThread Helm chart:
+
+| Value | Default | Description |
+|-------|---------|-------------|
+| `licenceToken` | `""` | GreenThread licence token (required) |
+| `huggingfaceToken` | `""` | HuggingFace API token for gated models |
+| `controller.replicas` | `2` | Controller replica count |
+| `storage.modelsPath` | `/mnt/models` | Host path for NVMe model storage |
+| `storage.pinnedMemoryMB` | `4096` | Pinned memory pool size in MB |
+| `storage.pinnedChunks` | `8` | Number of pinned memory chunks |
+| `gateway.enabled` | `true` | Create Gateway and HTTPRoutes |
+| `gateway.className` | `envoy` | GatewayClass name |
+| `gateway.requestTimeout` | `300s` | Request timeout (includes wake time) |
+| `apiserver.enabled` | `true` | Deploy the web UI |
+| `apiserver.port` | `3001` | API server port |
+| `monitoring.enabled` | `false` | Deploy ServiceMonitors and Grafana dashboards |
+| `vllm.runtimeClassName` | `nvidia` | RuntimeClass for GPU pods |
+| `lmcache.enabled` | `false` | Enable KV cache persistence (Redis) |
+
+## Troubleshooting
+
+### Node stuck at `NotReady`
+
+Usually caused by missing VPC CNI. Verify `aws-node` DaemonSet exists:
+
+```bash
+kubectl get ds -n kube-system
+```
+
+If missing, install the VPC CNI add-on (see [AWS EKS](/k8s-aws-eks)).
+
+### Storage pod `Insufficient hugepages-2Mi`
+
+Hugepages must be configured at the kernel level on the GPU node. SSM into the node and set them manually:
+
+```bash
+echo 4096 > /proc/sys/vm/nr_hugepages
+echo "vm.nr_hugepages=4096" >> /etc/sysctl.conf
+sudo systemctl restart kubelet
+```
+
+### DRA driver: `nvidia-smi: not found`
+
+The GPU Operator installs drivers to `/run/nvidia/driver`, not the root filesystem. Ensure the DRA driver Helm install includes `--set nvidiaDriverRoot=/run/nvidia/driver`.
+
+### DRA controller stuck in `Pending`
+
+Managed Kubernetes services have no schedulable control plane nodes. Override the controller affinity:
+
+```bash
+--set controller.nodeSelector=null \
+--set "controller.affinity=null" \
+--set "controller.tolerations[0].key=CriticalAddonsOnly" \
+--set "controller.tolerations[0].operator=Exists"
+```
+
+### Load balancer stuck at `<pending>`
+
+1. **Missing subnet tags** — Tag subnets with `kubernetes.io/role/elb=1` for internet-facing or `kubernetes.io/role/internal-elb=1` for internal
+2. **Missing IAM permissions** — Ensure the IRSA service account has load balancer and EC2 permissions
+3. **IRSA not configured** — If controller logs show `no EC2 IMDS role found`, the controller cannot reach instance metadata. Use IRSA instead of node instance roles
+
+### NLB targets not registering
+
+```bash
+# Check service account has the IRSA role annotation
+kubectl get sa aws-load-balancer-controller -n kube-system -o yaml | grep role-arn
+
+# Check controller logs for credential errors
+kubectl logs -n kube-system -l app.kubernetes.io/name=aws-load-balancer-controller --tail=30
+```
+
+### NVMe not mounted
+
+GreenThread expects models at `/mnt/models`. Verify the bootstrap script mounted the NVMe device:
+
+```bash
+# SSM into the GPU node
+aws ssm start-session --target <instance-id> --region us-west-2
+
+df -h /mnt/models
+ls -la /mnt/models/
+```
+
+## Next steps
+
+- [Deploying Models](/deploying-models) — Deploy your first models
+- [Monitoring](/k8s-monitoring) — Set up Prometheus and Grafana dashboards
+- [Inference API](/inference-api) — Full endpoint reference
+- [Model Configuration](/model-configuration) — Model CRD reference

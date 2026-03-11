@@ -1,0 +1,200 @@
+import { Callout } from '../components/callout'
+
+Models are deployed as `Model` custom resources in the `greenthread-system` namespace. GreenThread handles the HuggingFace download, format conversion to the `gthread` load format, and GPU scheduling automatically.
+
+## Deploy a model
+
+Create a Model resource:
+
+```yaml
+# llama-3-8b.yaml
+apiVersion: greenthread.ai/v1alpha1
+kind: Model
+metadata:
+  name: llama-3-8b
+  namespace: greenthread-system
+spec:
+  modelName: meta-llama/Llama-3.1-8B-Instruct
+  dtype: bfloat16
+  gpuMemoryUtilization: "0.90"
+  tensorParallelSize: 1
+  replicas: 1
+  extraArgs:
+    - "--enforce-eager"
+  fairness: {}
+  kvCache: {}
+  lora: {}
+  sleep: {}
+  staging: {}
+  resources: {}
+```
+
+Apply it:
+
+```bash
+kubectl apply -f llama-3-8b.yaml
+```
+
+<Callout type="info" title="Gated models">
+Some models (e.g. Llama) require a HuggingFace token with access granted. Set your token via `--set huggingfaceToken=hf_xxxx` during Helm install.
+</Callout>
+
+## Multi-model deployment
+
+Deploy multiple models in a single file:
+
+```yaml
+# models.yaml
+---
+apiVersion: greenthread.ai/v1alpha1
+kind: Model
+metadata:
+  name: llama-3-8b
+  namespace: greenthread-system
+spec:
+  modelName: meta-llama/Llama-3.1-8B-Instruct
+  dtype: bfloat16
+  gpuMemoryUtilization: "0.90"
+  tensorParallelSize: 1
+  replicas: 1
+  extraArgs:
+    - "--enforce-eager"
+  fairness: {}
+  kvCache: {}
+  lora: {}
+  sleep: {}
+  staging: {}
+  resources: {}
+
+---
+apiVersion: greenthread.ai/v1alpha1
+kind: Model
+metadata:
+  name: qwen-3-4b
+  namespace: greenthread-system
+spec:
+  modelName: Qwen/Qwen3-4B
+  dtype: bfloat16
+  gpuMemoryUtilization: "0.90"
+  tensorParallelSize: 1
+  replicas: 1
+  extraArgs:
+    - "--enforce-eager"
+  fairness: {}
+  kvCache: {}
+  lora: {}
+  sleep: {}
+  staging: {}
+  resources: {}
+```
+
+```bash
+kubectl apply -f models.yaml
+```
+
+## Monitor model status
+
+```bash
+kubectl get model -A
+```
+
+Models progress through these phases:
+
+| Phase | Description |
+|---|---|
+| `Pending` | Model resource created, waiting for conversion |
+| `Converting` | Downloading from HuggingFace and converting to `gthread` load format on NVMe storage |
+| `Staging` | Weights are staged into CPU memory or verified on disk |
+| `Ready` | Model is ready for inference — either actively serving or sleeping on NVMe |
+
+For more detail on phases and sidecar states, see [Lifecycle & States](/model-states).
+
+## Monitor GPU assignment
+
+```bash
+kubectl get gpu -A
+```
+
+GreenThread's scheduler assigns models to GPUs based on available memory. With `tensorParallelSize: 1`, each model replica occupies a single GPU. Multiple models may share a GPU if memory permits — sleeping models release all VRAM.
+
+## Verify inference
+
+### Get the gateway URL
+
+```bash
+GATEWAY_URL=$(kubectl get gateway -n greenthread-system greenthread-gateway \
+  -o jsonpath='{.status.addresses[0].value}')
+echo $GATEWAY_URL
+```
+
+### Check model status
+
+Each model exposes a `/status` endpoint through the gateway:
+
+```bash
+curl http://$GATEWAY_URL/llama-3-8b/status
+```
+
+Response when sleeping:
+
+```json
+{"model":"llama-3-8b","state":"sleeping","bootReady":true,"queue":{"inFlight":0,"barriered":false}}
+```
+
+### Test wake-on-request
+
+Requesting a sleeping model triggers an automatic wake:
+
+```bash
+curl http://$GATEWAY_URL/llama-3-8b/v1/models
+```
+
+Verify the model transitioned to serving:
+
+```bash
+curl http://$GATEWAY_URL/llama-3-8b/status
+```
+
+```json
+{"model":"llama-3-8b","state":"serving","bootReady":true,"queue":{"inFlight":0,"barriered":false}}
+```
+
+### Send an inference request
+
+```bash
+curl http://$GATEWAY_URL/llama-3-8b/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "meta-llama/Llama-3.1-8B-Instruct",
+    "messages": [{"role": "user", "content": "Hello, what model are you?"}],
+    "max_tokens": 128
+  }'
+```
+
+<Callout type="tip" title="Model field">
+The `model` field in the request body uses the full HuggingFace model ID (e.g. `meta-llama/Llama-3.1-8B-Instruct`), while the URL path uses the Model CRD name (e.g. `llama-3-8b`).
+</Callout>
+
+## Update a model
+
+Edit the Model CRD and re-apply:
+
+```bash
+kubectl apply -f llama-3-8b.yaml
+```
+
+Changes to fields like `extraArgs`, `fairness`, `sleep`, and `staging` take effect on the next pod restart. Changes to `modelName` or `tensorParallelSize` trigger a full re-conversion.
+
+## Delete a model
+
+```bash
+kubectl delete model llama-3-8b -n greenthread-system
+```
+
+This removes the model pod, releases GPU memory, and cleans up the HTTPRoute. Converted model weights remain on NVMe storage for faster re-deployment.
+
+## Next steps
+
+- [Model CRD Reference](/model-configuration) — Full spec documentation for all Model CRD fields
+- [Recipes](/recipes) — Ready-to-use CRDs for popular models
+- [Inference API](/inference-api) — Supported endpoints and protocols

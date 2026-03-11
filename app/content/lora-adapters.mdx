@@ -1,8 +1,44 @@
-import { ApiEndpoint } from '../components/api-endpoint'
 import { Callout } from '../components/callout'
 import { Mermaid } from '../components/mermaid'
 
 GreenThread supports serving LoRA adapters on top of base models with on-demand loading and automatic caching. Adapters are loaded lazily on first request and cached on the node for subsequent use.
+
+## Enable LoRA in the Model CRD
+
+LoRA support is configured in the `lora` section of the Model CRD:
+
+```yaml
+apiVersion: greenthread.ai/v1alpha1
+kind: Model
+metadata:
+  name: llama-3-1-8b
+  namespace: greenthread-system
+spec:
+  modelName: meta-llama/Llama-3.1-8B-Instruct
+  dtype: bfloat16
+  gpuMemoryUtilization: "0.90"
+  tensorParallelSize: 1
+  replicas: 1
+  extraArgs:
+    - "--enforce-eager"
+  lora:
+    enabled: true
+    maxRank: 64
+    cacheDir: /tmp/lora-cache
+    downloadTimeout: 5m
+  fairness: {}
+  kvCache: {}
+  sleep: {}
+  staging: {}
+  resources: {}
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `lora.enabled` | bool | `false` | Enable LoRA adapter loading. Maps to vLLM `--enable-lora`. |
+| `lora.maxRank` | int | `64` | Maximum LoRA rank supported. Must be >= the rank of any adapter you serve. Maps to `--max-lora-rank`. |
+| `lora.cacheDir` | string | `""` | Local path for downloaded LoRA adapter files. |
+| `lora.downloadTimeout` | duration | `5m` | Maximum time to wait for adapter download from object storage. |
 
 ## How it works
 
@@ -36,7 +72,11 @@ This means no upfront provisioning, no unnecessary S3 operations, and no per-req
 
 ## Request format
 
-Add the `lora_adapter_metadata` field alongside your normal request body on the standard `/v1/chat/completions` and `/v1/completions` endpoints.
+Add the `lora_adapter_metadata` field alongside your normal request body on the `/v1/chat/completions` and `/v1/completions` endpoints. Requests are routed through the gateway as usual:
+
+```
+POST http://<gateway-url>/<model-name>/v1/chat/completions
+```
 
 ### `lora_adapter_metadata` schema
 
@@ -68,6 +108,13 @@ Add the `lora_adapter_metadata` field alongside your normal request body on the 
 The recommended pattern is a try/catch in your proxy layer:
 
 ```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://<gateway-url>/llama-3-1-8b/v1",
+    api_key="not-needed",
+)
+
 def inference_with_lora(prompt, adapter):
     payload = {
         "model": "meta-llama/Llama-3.1-8B-Instruct",
@@ -81,7 +128,10 @@ def inference_with_lora(prompt, adapter):
         }
     }
 
-    response = requests.post(GREENTHREAD_URL, json=payload)
+    response = requests.post(
+        "http://<gateway-url>/llama-3-1-8b/v1/chat/completions",
+        json=payload,
+    )
 
     if response.status_code == 404:
         # Adapter not cached — add signed file URLs and retry
@@ -89,10 +139,26 @@ def inference_with_lora(prompt, adapter):
             filename: generate_signed_url(key)
             for filename, key in adapter.file_keys.items()
         }
-        response = requests.post(GREENTHREAD_URL, json=payload)
+        response = requests.post(
+            "http://<gateway-url>/llama-3-1-8b/v1/chat/completions",
+            json=payload,
+        )
 
     return response.json()
 ```
+
+### S3 access with IRSA
+
+If your LoRA adapters are stored in S3, configure a Kubernetes ServiceAccount with IAM Roles for Service Accounts (IRSA) and reference it in the Model CRD:
+
+```yaml
+spec:
+  serviceAccountName: lora-adapter-sa
+  lora:
+    enabled: true
+```
+
+The model pod will use this service account's credentials to access S3.
 
 ## Cache invalidation
 
@@ -117,16 +183,13 @@ LoRA adapters must include:
 
 Any LoRA adapter trained with PEFT and exported in this format is compatible.
 
-## Configuration
+## Sleep/wake with LoRA
 
-LoRA support is configured at the model level:
+LoRA adapters work seamlessly with GreenThread's sleep/wake system. When a model with LoRA enabled sleeps and wakes:
 
-| Setting | Description | Default |
-|---------|-------------|---------|
-| `enable_lora` | Enable LoRA adapter support | `false` |
-| `max_lora_rank` | Maximum LoRA rank supported (1–512) | `64` |
-
-The `max_lora_rank` must be equal to or greater than the rank of any adapter you intend to serve.
+- The base model weights are checkpointed and restored via the normal sleep/wake flow
+- Cached LoRA adapters persist on the node's local filesystem (`cacheDir`)
+- After wake, adapters are re-loaded on first request from the local cache — no re-download needed
 
 ## Error responses
 
@@ -135,3 +198,4 @@ The `max_lora_rank` must be equal to or greater than the rank of any adapter you
 | `404` | `not_found` | Adapter not in cache, no `files` provided. Retry with URLs. |
 | `400` | `bad_request` | Missing required fields (`id` or `name`). |
 | `502` | `bad_gateway` | Failed to download adapter files from provided URLs. |
+| `503` | `service_unavailable` | Model is booting or draining for sleep. |

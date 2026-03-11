@@ -19,9 +19,34 @@ export const sections: DocSection[] = [
         description: "What GreenThread is and how it works",
       },
       {
-        slug: "authentication",
-        title: "Authentication",
-        description: "API keys and Bearer token auth",
+        slug: "k8s-overview",
+        title: "Architecture",
+        description: "Components, request flow, and sidecar endpoints",
+      },
+    ],
+  },
+  {
+    title: "Deployment",
+    pages: [
+      {
+        slug: "k8s-aws-eks",
+        title: "AWS (EKS)",
+        description: "Set up an EKS cluster with GPU nodes",
+      },
+      {
+        slug: "k8s-prerequisites",
+        title: "Prerequisites",
+        description: "GPU Operator, DRA Driver, and Envoy Gateway",
+      },
+      {
+        slug: "k8s-deploy",
+        title: "Install GreenThread",
+        description: "Helm install and verify",
+      },
+      {
+        slug: "k8s-monitoring",
+        title: "Monitoring",
+        description: "Prometheus, Grafana dashboards, and alerting",
       },
     ],
   },
@@ -30,23 +55,13 @@ export const sections: DocSection[] = [
     pages: [
       {
         slug: "inference-api",
-        title: "Inference API",
-        description: "OpenAI-compatible chat and completion endpoints",
-      },
-      {
-        slug: "model-list",
-        title: "Model List & Routing",
-        description: "List models, model-specific endpoints, and per-backend routing",
+        title: "API Reference",
+        description: "Supported inference endpoints and protocols",
       },
       {
         slug: "lora-adapters",
         title: "LoRA Adapters",
         description: "On-demand LoRA adapter loading and caching",
-      },
-      {
-        slug: "batch-api",
-        title: "Batch API",
-        description: "Asynchronous batch inference processing",
       },
     ],
   },
@@ -54,19 +69,24 @@ export const sections: DocSection[] = [
     title: "Models",
     pages: [
       {
-        slug: "adding-removing-models",
-        title: "Adding & Removing Models",
-        description: "Model CRUD operations and configuration",
+        slug: "model-configuration",
+        title: "Model CRD Reference",
+        description: "Model custom resource spec and configuration",
       },
       {
         slug: "model-states",
-        title: "Model States & Lifecycle",
-        description: "State machine, transitions, and health checks",
+        title: "Lifecycle & States",
+        description: "Phases, sleep/wake, and state transitions",
       },
       {
-        slug: "sleep-wake",
-        title: "Sleep & Wake",
-        description: "How sleep/wake works and performance characteristics",
+        slug: "deploying-models",
+        title: "Deploying Models",
+        description: "Deploy, update, and verify models",
+      },
+      {
+        slug: "recipes",
+        title: "Recipes",
+        description: "Example deployments for popular models",
       },
     ],
   },
@@ -75,33 +95,18 @@ export const sections: DocSection[] = [
     pages: [
       {
         slug: "fairness-policy",
-        title: "Fairness Policy",
-        description: "Preemption algorithm and GPU scheduling",
+        title: "GPU Scheduling",
+        description: "Fairness policy, preemption, and GPU assignment",
       },
       {
         slug: "storage-pinning",
         title: "Storage & Pinning",
-        description: "Disk and RAM tiers, staging, and pinning",
+        description: "NVMe storage, staging tiers, and pinning",
       },
       {
         slug: "metrics-usage",
-        title: "Metrics & Usage",
-        description: "Prometheus metrics, usage tracking, and billing",
-      },
-    ],
-  },
-  {
-    title: "Integration",
-    pages: [
-      {
-        slug: "real-time-events",
-        title: "Real-time Events (SSE)",
-        description: "Server-Sent Events for live state updates",
-      },
-      {
-        slug: "model-configuration",
-        title: "Model Configuration",
-        description: "Inference engine config, GPU memory, quantization, and tuning",
+        title: "Metrics",
+        description: "Prometheus metrics and observability",
       },
     ],
   },
@@ -116,27 +121,27 @@ export const sections: DocSection[] = [
     ],
   },
   {
-    title: "Deployment",
+    title: "Deprecated (Single Node)",
     pages: [
       {
         slug: "requirements",
         title: "Requirements",
-        description: "Hardware, software, and licence requirements",
+        description: "Deprecated — hardware requirements",
       },
       {
         slug: "prerequisites",
         title: "Prerequisites",
-        description: "NVIDIA drivers, GPU Direct Storage, and Python setup",
+        description: "Deprecated — NVIDIA drivers, GDS, Python",
       },
       {
         slug: "install",
         title: "Install",
-        description: "Install GreenThread with the one-line installer",
+        description: "Deprecated — one-line installer",
       },
       {
         slug: "troubleshooting",
         title: "Troubleshooting",
-        description: "Common issues, diagnostics, and upgrades",
+        description: "Deprecated — diagnostics",
       },
     ],
   },
